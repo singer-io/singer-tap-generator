@@ -32,7 +32,7 @@ def raise_for_error(response: requests.Response) -> None:
 
 class Client:
     """
-    A Wrapper class with support for V1 & V3 and UGC Yotpo api.
+    A Wrapper class.
     ~~~
     Performs:
      - Authentication
