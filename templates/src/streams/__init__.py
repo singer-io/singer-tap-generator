@@ -1,5 +1,5 @@
 {% for stream in config.streams %}
-from streams.{{ stream.name }} import {{ stream.name|capitalize }}
+from {{tap_name}}.streams.{{ stream.name }} import {{ stream.name|capitalize }}
 {% endfor %}
 
 STREAMS = {

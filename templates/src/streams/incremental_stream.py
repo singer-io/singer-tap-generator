@@ -7,7 +7,7 @@ from {{tap_name}}.streams.abstracts import IncrementalStream
 
 LOGGER = get_logger()
 
-class {{ stream.name|capitalize }}(IncrementalStream, PageSizeMixin):
+class {{ stream.name|capitalize }}(IncrementalStream):
     tap_stream_id = '{{ stream.name }}'
     key_properties = {{ stream.key_properties }}
     replication_keys = {{ stream.replication_keys }}

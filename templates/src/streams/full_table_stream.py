@@ -3,11 +3,11 @@ from typing import Dict, Iterator, List
 from singer import Transformer, get_logger, metrics, write_record
 from singer.utils import strftime, strptime_to_utc
 
-from {{tap_name}}.streams.abstracts import IncrementalStream
+from {{tap_name}}.streams.abstracts import FullTableStream
 
 LOGGER = get_logger()
 
-class {{ stream.name|capitalize }}(FullTableStream, PageSizeMixin):
+class {{ stream.name|capitalize }}(FullTableStream):
     tap_stream_id = '{{ stream.name }}'
     key_properties = {{ stream.key_properties }}
     {% if stream.data_key %}

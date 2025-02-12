@@ -47,7 +47,13 @@ class Client:
         self.req_counter: metrics.Counter = None
         self.req_timer: metrics.Timer = None
         
+
+    def __enter__(self):
+        pass
         
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
     @backoff.on_exception(wait_gen=backoff.expo, exception=(errors.Http401RequestError,), jitter=None, max_tries=1)
     def get(self, endpoint: str, params: Dict, headers: Dict) -> Any:
         """Calls the make_request method with a prefixed method type `GET`"""
