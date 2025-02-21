@@ -1,0 +1,38 @@
+{
+    "tap_name": "ActiveCampaign",
+    "required_config_keys": ["api_url", "api_token", "start_date", "user_agent"],
+    "page_size": 100,
+    "next_page_key": "offset",
+    "pagination_key": "limit",
+    "headers": {"Accept": "application/json"},
+    "params": {},
+    "auth_header_key": "access_token",
+    "auth_config_key": "access_token",
+    "base_url": "https://base_url.api-us1.com/api/3",
+    "streams": [
+      {
+        "name": "addresses",
+        "key_properties": ["id"],
+        "replication_method": "FULL_TABLE",
+        "path": "addresses",
+        "data_key": "addresses"
+      },
+      {
+        "name": "contacts",
+        "key_properties": ["id"],
+        "replication_method": "INCREMENTAL",
+        "replication_keys": ["udate"],
+        "path": "contacts",
+        "data_key": "contacts"
+      }
+    ],
+    "tap_tester_creds": {
+      "api_url": "TAP_ACTIVECAMPAIGN_API_URL",
+      "api_token": "TAP_ACTIVECAMPAIGN_API_TOKEN"
+    },
+    "author": "Stitch Dev",
+    "third_party_dependencies": [
+      "requests==2.22.0",
+      "singer-python>=5.0.12"
+    ]
+  }

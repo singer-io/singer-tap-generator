@@ -17,9 +17,16 @@ class {{ stream.name|capitalize }}(IncrementalStream):
     {% if stream.url_endpoint %}
     url_endpoint = '{{ stream.url_endpoint }}'
     {% endif %}
-    {% if stream.pagination %}
-    pagination = {{ stream.pagination }}
-    {% endif %}
     {% if stream.params %}
     params = {{ stream.params }}
     {% endif %}
+    {% if stream.page_size %}
+    page_size = {{ stream.page_size }}
+    {% endif %}
+    {% if stream.next_page_key %}
+    next_page_key = '{{ stream.next_page_key }}'
+    {% endif %}
+    {% if stream.path %}
+    path = '{{ stream.path }}'
+    {% endif %}
+

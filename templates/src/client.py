@@ -3,12 +3,13 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 import backoff
 import requests
 from requests import session
+from requests.exceptions import Timeout, ConnectionError, ChunkedEncodingError
 from singer import get_logger, metrics
 
-from {{tap_name}} import exceptions as errors
+from {{tap_name}}.exceptions import ERROR_CODE_EXCEPTION_MAPPING, {{config.tap_name}}Error, {{config.tap_name}}BackoffError
 
 LOGGER = get_logger()
-
+REQUEST_TIMEOUT = 300
 
 def raise_for_error(response: requests.Response) -> None:
     """Raises the associated response exception. Takes in a response object,
@@ -18,17 +19,20 @@ def raise_for_error(response: requests.Response) -> None:
     :param resp: requests.Response object
     """
     try:
-        response.raise_for_status()
-    except (requests.HTTPError, requests.ConnectionError) as _:
-        try:
-            error_code = response.status_code
-            client_exception = getattr(
-                errors, f"Http{error_code}RequestError", errors.ClientError(message="Undefined Exception")
-            )
-            raise client_exception from None
-        except (ValueError, TypeError, AttributeError):
-            raise errors.ClientError(_) from None
-
+        response_json = response.json()
+    except Exception: # pylint: disable=broad-except
+        response_json = {}
+    if response.status_code != 200:
+        if response_json.get('error'):
+            message = "HTTP-error-code: {}, Error: {}".format(response.status_code, response_json.get('error'))
+        else:
+            message = "HTTP-error-code: {}, Error: {}".format(
+                response.status_code,
+                response_json.get("message", ERROR_CODE_EXCEPTION_MAPPING.get(
+                    response.status_code, {}).get("message", "Unknown Error")))
+        exc = ERROR_CODE_EXCEPTION_MAPPING.get(
+            response.status_code, {}).get("raise_exception", {{config.tap_name}}Error)
+        raise exc(message, response) from None
 
 class Client:
     """
@@ -39,49 +43,58 @@ class Client:
      - Response parsing
      - HTTP Error handling and retry
     """
-    
+
     def __init__(self, config: Mapping[str, Any]) -> None:
         self.config = config
         self._session = session()
-        self.__utoken = None
-        self.req_counter: metrics.Counter = None
-        self.req_timer: metrics.Timer = None
-        
+        self.base_url = '{{ config.base_url if config.base_url else "" }}'
+
+        # Set and pass request timeout to config param `request_timeout` value.
+        config_request_timeout = config.get('request_timeout')
+        if config_request_timeout and float(config_request_timeout):
+            self.request_timeout = float(config_request_timeout)
+        else:
+            self.request_timeout = REQUEST_TIMEOUT # If value is 0,"0","" or not passed then it set default to 300 seconds.
 
     def __enter__(self):
-        pass
-        
-    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.check_api_credentials()
+        return self
+
+    def __exit__(self, exception_type, exception_value, traceback):
+        self._session.close()
+
+    def check_api_credentials(self) -> None:
         pass
 
-    @backoff.on_exception(wait_gen=backoff.expo, exception=(errors.Http401RequestError,), jitter=None, max_tries=1)
-    def get(self, endpoint: str, params: Dict, headers: Dict) -> Any:
+    def authenticate(self, headers: Dict, params: Dict) -> Tuple[Dict, Dict]:
+        """Authenticates the request with the token"""
+        headers['{{ config.auth_header_key if config.auth_header_key else auth_header_key }}'] = self.config['{{ config.auth_config_key if config.auth_config_key else auth_config_key }}']
+        return headers, params
+
+    def get(self, endpoint: str, params: Dict, headers: Dict, path: str = None) -> Any:
         """Calls the make_request method with a prefixed method type `GET`"""
+        endpoint = endpoint or f"{self.base_url}/{path}"
         headers, params = self.authenticate(headers, params)
-        return self.__make_request("GET", endpoint, headers=headers, params=params)
+        return self.__make_request("GET", endpoint, headers=headers, params=params, timeout=self.request_timeout)
 
-    def post(self, endpoint: str, params: Dict, headers: Dict, body: Dict) -> Any:
+    def post(self, endpoint: str, params: Dict, headers: Dict, body: Dict, path: str = None) -> Any:
         """Calls the make_request method with a prefixed method type `POST`"""
         # pylint: disable=R0913
         headers, params = self.authenticate(headers, params)
-        self.__make_request("POST", endpoint, headers=headers, params=params, data=body)
+        self.__make_request("POST", endpoint, headers=headers, params=params, data=body, timeout=self.request_timeout)
+
 
     @backoff.on_exception(
         wait_gen=backoff.expo,
         exception=(
-            errors.Http400RequestError,
-            errors.Http404RequestError,
-            errors.Http406RequestError,
-            errors.Http500RequestError,
-            errors.Http502RequestError,
-            errors.Http503RequestError,
-            errors.Http504RequestError,
+            ConnectionResetError,
+            ConnectionError,
+            ChunkedEncodingError,
+            Timeout,
+            {{config.tap_name}}BackoffError
         ),
-        jitter=None,
         max_tries=5,
-    )
-    @backoff.on_exception(
-        wait_gen=backoff.expo, exception=errors.Http429RequestError, jitter=None, max_time=60, max_tries=6
+        factor=2,
     )
     def __make_request(self, method: str, endpoint: str, **kwargs) -> Optional[Mapping[Any, Any]]:
         """
@@ -96,22 +109,8 @@ class Client:
         Returns:
             Dict,List,None: Returns a `Json Parsed` HTTP Response or None if exception
         """
-        response = self._session.request(method, endpoint, **kwargs)
-        if self.req_counter:
-            self.req_counter.increment()
-        if response.status_code != 200:
-            try:
-                LOGGER.error("Failed due: %s", response.text)
-            except AttributeError:
-                pass
-            try:
-                raise_for_error(response)
-            except errors.Http401RequestError as _:
-                LOGGER.info("Authorization Failure, attempting to regenrate token")
-                self._get_auth_token(force=True)
-                raise _
-            except errors.Http404RequestError as _:
-                LOGGER.error("Resource Not Found %s", response.url or "")
-                raise _
-            return None
+        with metrics.http_request_timer(endpoint) as timer:
+            response = self._session.request(method, endpoint, **kwargs)
+            raise_for_error(response)
+
         return response.json()

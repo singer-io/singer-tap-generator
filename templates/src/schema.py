@@ -1,18 +1,19 @@
 import os
 import json
 import singer
+from typing import Dict, Tuple
 from singer import metadata
 from {{tap_name}}.streams import STREAMS
 
 LOGGER = singer.get_logger()
 
-def get_abs_path(path):
+def get_abs_path(path: str) -> str:
     """
     Get the absolute path for the schema files.
     """
     return os.path.join(os.path.dirname(os.path.realpath(__file__)), path)
 
-def load_schema_references():
+def load_schema_references() -> Dict:
     """
     Load the schema files from the schema folder and return the schema references.
     """
@@ -30,7 +31,7 @@ def load_schema_references():
 
     return refs
 
-def get_schemas():
+def get_schemas() -> Tuple[Dict, Dict]:
     """
     Load the schema references, prepare metadata for each streams and return schema and metadata for the catalog.
     """
@@ -56,7 +57,7 @@ def get_schemas():
         mdata = metadata.to_map(mdata)
 
         # Make replication keys/primary keys of automatic inclusion
-        automatic_keys = getattr(stream_obj, 'key_properties') + (getattr(stream_obj, 'replication_keys') or [])
+        automatic_keys = getattr(stream_obj, 'replication_keys') or []
         for field_name in schema['properties'].keys():
             if field_name in automatic_keys:
                 mdata = metadata.write(mdata, ('properties', field_name), 'inclusion', 'automatic')

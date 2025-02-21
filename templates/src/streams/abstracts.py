@@ -8,10 +8,12 @@ from singer import (
     metrics,
     write_bookmark,
     write_record,
+    write_schema,
 )
 from singer.utils import strftime, strptime_to_utc
 
 LOGGER = get_logger()
+
 
 class BaseStream(ABC):
     """
@@ -24,10 +26,12 @@ class BaseStream(ABC):
      - `sync` and `get_records` method for performing sync
     """
 
-    @property
-    @abstractmethod
-    def stream(self) -> str:
-        """Display Name of the stream."""
+    url_endpoint = ""
+    path = ""
+    page_size = {{config.page_size if config.page_size else 0}}
+    next_page_key = "{{ config.next_page_key if config.next_page_key else offset }}"
+    params = {{config.params if config.params else {}}}
+    headers = {{config.headers if config.headers else {}}}
 
     @property
     @abstractmethod
@@ -65,13 +69,10 @@ class BaseStream(ABC):
         has not expressed any opinion on whether or not to replicate it."""
         return False
 
-    @property
     @abstractmethod
-    def url_endpoint(self) -> str:
-        """Defines the HTTP endpoint for the stream."""
-
-    @abstractmethod
-    def sync(self, state: Dict, schema: Dict, stream_metadata: Dict, transformer: Transformer) -> Dict:
+    def sync(
+        self, state: Dict, schema: Dict, stream_metadata: Dict, transformer: Transformer
+    ) -> Dict:
         """
         Performs a replication sync for the stream.
         ~~~
@@ -92,67 +93,99 @@ class BaseStream(ABC):
 
     def get_records(self) -> List:
         """Interacts with api client interaction and pagination."""
-        extraction_url = self.get_url_endpoint()
-        page_count, params = 1, {"limit": self.page_size}
+        extraction_url = self.url_endpoint
+        page_count = 1
+        if self.page_size:
+            self.params.update({"{{ config.pagination_key if config.pagination_key else offset }}": self.page_size})
+
         while True:
             LOGGER.info("Calling Page %s", page_count)
-            response = self.client.get(extraction_url, params, {}, {})
+            response = self.client.get(
+                extraction_url, self.params, self.headers, self.path
+            )
 
-            # retrieve records from response.collections key
-            raw_records = response.get(self.stream, [])
-
-            # retrieve pagination from response.pagination.next_page_info key
-            next_param = response.get("pagination", {}).get("next_page_info", None)
+            raw_records = response.get(self.data_key, [])
+            next_page = response.get(self.next_page_key)
 
             if not raw_records:
                 LOGGER.warning("No records found on Page %s", page_count)
                 break
-            params["page_info"] = next_param
+            self.params[self.next_page_key] = next_page
             page_count += 1
             yield from raw_records
-            if not next_param:
+            if not next_page:
                 break
+
+    def write_schema(self, schema, stream_name):
+        """
+        Write a schema message.
+        """
+        try:
+            write_schema(stream_name, schema, self.key_properties)
+        except OSError as err:
+            LOGGER.error("OS Error while writing schema for: {}".format(stream_name))
+            raise err
+
 
 class IncrementalStream(BaseStream):
     """Base Class for Incremental Stream."""
 
     replication_method = "INCREMENTAL"
     forced_replication_method = "INCREMENTAL"
-    config_start_key = None
+    config_start_key = "start_date"
 
     def get_bookmark(self, state: dict, key: Any = None) -> int:
         """A wrapper for singer.get_bookmark to deal with compatibility for
         bookmark values or start values."""
         return get_bookmark(
-            state, self.tap_stream_id, key or self.replication_keys, self.client.config.get(self.config_start_key, False)
+            state,
+            self.tap_stream_id,
+            key or self.replication_keys[0],
+            self.client.config.get(self.config_start_key, False),
         )
 
     def write_bookmark(self, state: dict, key: Any = None, value: Any = None) -> Dict:
         """A wrapper for singer.get_bookmark to deal with compatibility for
         bookmark values or start values."""
-        return write_bookmark(state, self.tap_stream_id, key or self.replication_keys, value)
-    
-    def sync(self, state: Dict, schema: Dict, stream_metadata: Dict, transformer: Transformer) -> Dict:
+        return write_bookmark(
+            state, self.tap_stream_id, key or self.replication_keys[0], value
+        )
+
+    def sync(
+        self, state: Dict, schema: Dict, stream_metadata: Dict, transformer: Transformer
+    ) -> Dict:
         bookmark_date = self.get_bookmark(state)
-        current_max_bookmark_date = bookmark_date_to_utc = strptime_to_utc(bookmark_date)
-        skip_record_count = 0
+        current_max_bookmark_date = bookmark_date_to_utc = strptime_to_utc(
+            bookmark_date
+        )
         with metrics.record_counter(self.tap_stream_id) as counter:
             for record in self.get_records():
+                transformed_record = transformer.transform(
+                    record, schema, stream_metadata
+                )
                 try:
-                    record_timestamp = strptime_to_utc(record[self.replication_keys[0]])
+                    record_timestamp = strptime_to_utc(
+                        transformed_record[self.replication_keys[0]]
+                    )
                 except KeyError as _:
-                    LOGGER.error("Unable to process Record, Exception occurred: %s for stream %s", _, self.__class__)
+                    LOGGER.error(
+                        "Unable to process Record, Exception occurred: %s for stream %s",
+                        _,
+                        self.__class__,
+                    )
                     continue
                 if record_timestamp >= bookmark_date_to_utc:
-                    write_record(self.tap_stream_id, transformer.transform(record, schema, stream_metadata))
-                    current_max_bookmark_date = max(current_max_bookmark_date, record_timestamp)
+                    write_record(self.tap_stream_id, transformed_record)
+                    current_max_bookmark_date = max(
+                        current_max_bookmark_date, record_timestamp
+                    )
                     counter.increment()
-                else:
-                    skip_record_count += 1
 
-            state = self.write_bookmark(state, value=strftime(current_max_bookmark_date))
-        LOGGER.warning(f"Total number of records skipped due to older timestamp = {skip_record_count}")
-        return state
+            state = self.write_bookmark(
+                state, value=strftime(current_max_bookmark_date)
+            )
+            return counter.value
+
 
 class FullTableStream(BaseStream):
     """Base Class for Incremental Stream."""
@@ -161,12 +194,18 @@ class FullTableStream(BaseStream):
     forced_replication_method = "FULL_TABLE"
     valid_replication_keys = None
     replication_keys = None
-            
-    def sync(self, state: Dict, schema: Dict, stream_metadata: Dict, transformer: Transformer) -> Dict:
+
+    total_records = 0
+
+    def sync(
+        self, state: Dict, schema: Dict, stream_metadata: Dict, transformer: Transformer
+    ) -> Dict:
         """Abstract implementation for `type: Fulltable` stream."""
         with metrics.record_counter(self.tap_stream_id) as counter:
             for record in self.get_records():
-                transformed_record = transformer.transform(record, schema, stream_metadata)
+                transformed_record = transformer.transform(
+                    record, schema, stream_metadata
+                )
                 write_record(self.tap_stream_id, transformed_record)
                 counter.increment()
-        return state
+            return counter.value

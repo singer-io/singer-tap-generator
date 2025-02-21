@@ -21,20 +21,18 @@ def do_discover():
 def main():
 
     parsed_args = singer.utils.parse_args(REQUIRED_CONFIG_KEYS)
+    state = {}
+    if parsed_args.state:
+        state = parsed_args.state
 
     with Client(parsed_args.config) as client:
-
-        state = {}
-        if parsed_args.state:
-            state = parsed_args.state
-
         if parsed_args.discover:
             do_discover()
         elif parsed_args.catalog:
             sync(client=client,
-                 config=parsed_args.config,
-                 catalog=parsed_args.catalog,
-                 state=state)
+                    config=parsed_args.config,
+                    catalog=parsed_args.catalog,
+                    state=state)
 
 if __name__ == '__main__':
     main()

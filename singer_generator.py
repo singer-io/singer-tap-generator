@@ -196,8 +196,9 @@ class SingerTapGenerator:
 
             # Generate empty schema file (to be filled manually)
             schema_file = os.path.join(stream_dir, "schemas", f"{schema_name}.json")
-            with open(schema_file, "w") as f:
-                json.dump({}, f, indent=4)
+            if not os.path.exists(schema_file):
+                with open(schema_file, "w") as f:
+                    json.dump({}, f, indent=4)
 
             # Generate stream implementation based on replication method
             stream_file = os.path.join(stream_dir, "streams", f"{schema_name}.py")

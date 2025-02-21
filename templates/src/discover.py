@@ -5,7 +5,10 @@ from {{tap_name}}.schema import get_schemas
 
 LOGGER = singer.get_logger()
 
-def discover():
+def discover() -> Catalog:
+    """
+    Run the discovery mode, prepare the catalog file and return the catalog.
+    """
     schemas, field_metadata = get_schemas()
     catalog = Catalog([])
 
