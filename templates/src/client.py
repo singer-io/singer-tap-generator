@@ -23,8 +23,8 @@ def raise_for_error(response: requests.Response) -> None:
     except Exception: # pylint: disable=broad-except
         response_json = {}
     if response.status_code != 200:
-        if response_json.get('error'):
-            message = "HTTP-error-code: {}, Error: {}".format(response.status_code, response_json.get('error'))
+        if response_json.get("error"):
+            message = "HTTP-error-code: {}, Error: {}".format(response.status_code, response_json.get("error"))
         else:
             message = "HTTP-error-code: {}, Error: {}".format(
                 response.status_code,
@@ -47,10 +47,10 @@ class Client:
     def __init__(self, config: Mapping[str, Any]) -> None:
         self.config = config
         self._session = session()
-        self.base_url = '{{ config.base_url if config.base_url else "" }}'
+        self.base_url = "{{ config.base_url if config.base_url else "" }}"
 
         # Set and pass request timeout to config param `request_timeout` value.
-        config_request_timeout = config.get('request_timeout')
+        config_request_timeout = config.get("request_timeout")
         if config_request_timeout and float(config_request_timeout):
             self.request_timeout = float(config_request_timeout)
         else:
@@ -68,7 +68,7 @@ class Client:
 
     def authenticate(self, headers: Dict, params: Dict) -> Tuple[Dict, Dict]:
         """Authenticates the request with the token"""
-        headers['{{ config.auth_header_key if config.auth_header_key else auth_header_key }}'] = self.config['{{ config.auth_config_key if config.auth_config_key else auth_config_key }}']
+        headers["{{ config.auth_header_key if config.auth_header_key else auth_header_key }}"] = self.config["{{ config.auth_config_key if config.auth_config_key else auth_config_key }}"]
         return headers, params
 
     def get(self, endpoint: str, params: Dict, headers: Dict, path: str = None) -> Any:

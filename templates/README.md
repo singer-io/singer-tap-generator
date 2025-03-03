@@ -9,7 +9,7 @@ This tap:
 - Pulls raw data from the [{{config.tap_name}} API].
 - Extracts the following resources:
     {% for stream in config.streams %}
-    - {{stream.name|capitalize}}(https://github.com/singer-io)
+    - [{{stream.name|camel_case}}]({{ stream.doc_link if stream.doc_link else https://github.com/singer-io}})
 
     {% endfor %}
 - Outputs the schema for each resource
@@ -20,7 +20,7 @@ This tap:
 
 
 {% for stream in config.streams %}
-** [{{stream.name}}](https://github.com/singer-io)**
+** [{{stream.name}}]({{ stream.doc_link if stream.doc_link else https://github.com/singer-io}})**
 {% if stream.url_endpoint %}
 - Endpoint: {{ stream.url_endpoint }}
 {% endif %}
@@ -125,7 +125,7 @@ This tap:
 
     To [check the tap](https://github.com/singer-io/singer-tools#singer-check-tap) and verify working:
     ```bash
-    > tap-mixpanel --config tap_config.json --catalog catalog.json | singer-check-tap > state.json
+    > tap_{{config.tap_name|lower}} --config tap_config.json --catalog catalog.json | singer-check-tap > state.json
     > tail -1 state.json > state.json.tmp && mv state.json.tmp state.json
     ```
 

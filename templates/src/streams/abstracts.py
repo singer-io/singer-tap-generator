@@ -9,8 +9,9 @@ from singer import (
     write_bookmark,
     write_record,
     write_schema,
+    metadata
 )
-from singer.utils import strftime, strptime_to_utc
+from singer.utils import strftime, strftime, strptime_with_tz
 
 LOGGER = get_logger()
 
@@ -30,8 +31,19 @@ class BaseStream(ABC):
     path = ""
     page_size = {{config.page_size if config.page_size else 0}}
     next_page_key = "{{ config.next_page_key if config.next_page_key else offset }}"
-    params = {{config.params if config.params else {}}}
     headers = {{config.headers if config.headers else {}}}
+    children = []
+    parent = ""
+    data_key = ""
+    parent_bookmark_key = ""
+
+    def __init__(self, client=None, catalog=None) -> None:
+        self.client = client
+        self.catalog = catalog
+        self.schema = catalog.schema.to_dict()
+        self.metadata = metadata.to_map(catalog.metadata)
+        self.child_to_sync = []
+        self.params = {{config.params if config.params else {}}}
 
     @property
     @abstractmethod
@@ -55,84 +67,87 @@ class BaseStream(ABC):
 
     @property
     @abstractmethod
-    def forced_replication_method(self) -> str:
-        """Defines the sync mode of a stream."""
-
-    @property
-    @abstractmethod
     def key_properties(self) -> Tuple[str, str]:
         """List of key properties for stream."""
 
-    @property
-    def selected_by_default(self) -> bool:
-        """Indicates if a node in the schema should be replicated, if a user
-        has not expressed any opinion on whether or not to replicate it."""
-        return False
+    @classmethod
+    def is_selected(cls):
+        return metadata.get(self.metadata, (), "selected")
 
     @abstractmethod
     def sync(
-        self, state: Dict, schema: Dict, stream_metadata: Dict, transformer: Transformer
+        self,
+        state: Dict,
+        transformer: Transformer,
+        parent_obj: Dict = None,
     ) -> Dict:
         """
         Performs a replication sync for the stream.
         ~~~
         Args:
          - state (dict): represents the state file for the tap.
-         - schema (dict): Schema of the stream
          - transformer (object): A Object of the singer.transformer class.
+         - parent_obj (dict): The parent object for the stream.
 
         Returns:
          - bool: The return value. True for success, False otherwise.
 
         Docs:
-         - https://github.com/singer-io/getting-started/blob/master/docs/SYNC_MODE.md#replication-method
+         - https://github.com/singer-io/getting-started/blob/master/docs/SYNC_MODE.md
         """
 
-    def __init__(self, client=None) -> None:
-        self.client = client
 
     def get_records(self) -> List:
         """Interacts with api client interaction and pagination."""
-        extraction_url = self.url_endpoint
-        page_count = 1
-        if self.page_size:
-            self.params.update({"{{ config.pagination_key if config.pagination_key else offset }}": self.page_size})
+        self.params["{{ config.pagination_key if config.pagination_key else limit }}"] = self.page_size
 
         while True:
-            LOGGER.info("Calling Page %s", page_count)
             response = self.client.get(
-                extraction_url, self.params, self.headers, self.path
+                self.url_endpoint, self.params, self.headers, self.path
             )
-
             raw_records = response.get(self.data_key, [])
             next_page = response.get(self.next_page_key)
 
-            if not raw_records:
-                LOGGER.warning("No records found on Page %s", page_count)
-                break
             self.params[self.next_page_key] = next_page
-            page_count += 1
             yield from raw_records
             if not next_page:
                 break
 
-    def write_schema(self, schema, stream_name):
+
+    def write_schema(self):
         """
         Write a schema message.
         """
         try:
-            write_schema(stream_name, schema, self.key_properties)
+            write_schema(self.tap_stream_id, self.schema, self.key_properties)
         except OSError as err:
-            LOGGER.error("OS Error while writing schema for: {}".format(stream_name))
+            LOGGER.error(
+                "OS Error while writing schema for: {}".format(self.tap_stream_id)
+            )
             raise err
+
+    def update_params(self, **kwargs):
+        """
+        Update params for the stream
+        """
+        self.params.update(kwargs)
+
+    def modify_object(self, record: Dict, parent_record: Dict = None) -> Dict:
+        """
+        Modify the record before writing to the stream
+        """
+        return record
+
+    def get_url_endpoint(self, parent_obj: Dict = None) -> str:
+        """
+        Get the URL endpoint for the stream
+        """
+        return self.url_endpoint or f"{self.client.base_url}/{self.path}"
 
 
 class IncrementalStream(BaseStream):
     """Base Class for Incremental Stream."""
 
-    replication_method = "INCREMENTAL"
-    forced_replication_method = "INCREMENTAL"
-    config_start_key = "start_date"
 
     def get_bookmark(self, state: dict, key: Any = None) -> int:
         """A wrapper for singer.get_bookmark to deal with compatibility for
@@ -141,7 +156,7 @@ class IncrementalStream(BaseStream):
             state,
             self.tap_stream_id,
             key or self.replication_keys[0],
-            self.client.config.get(self.config_start_key, False),
+            self.client.config.get("start_date", False),
         )
 
     def write_bookmark(self, state: dict, key: Any = None, value: Any = None) -> Dict:
@@ -151,61 +166,65 @@ class IncrementalStream(BaseStream):
             state, self.tap_stream_id, key or self.replication_keys[0], value
         )
 
+
     def sync(
-        self, state: Dict, schema: Dict, stream_metadata: Dict, transformer: Transformer
+        self,
+        state: Dict,
+        transformer: Transformer,
+        parent_obj: Dict = None,
     ) -> Dict:
-        bookmark_date = self.get_bookmark(state)
-        current_max_bookmark_date = bookmark_date_to_utc = strptime_to_utc(
-            bookmark_date
-        )
+        """Implementation for `type: Incremental` stream."""
+        current_max_bookmark_date = bookmark_date = self.get_bookmark(state)
+        self.update_params(updated_since=bookmark_date)
+        self.url_endpoint = self.get_url_endpoint(parent_obj)
+
         with metrics.record_counter(self.tap_stream_id) as counter:
             for record in self.get_records():
+                record = self.modify_object(record, parent_obj)
                 transformed_record = transformer.transform(
-                    record, schema, stream_metadata
+                    record, self.schema, self.metadata
                 )
-                try:
-                    record_timestamp = strptime_to_utc(
-                        transformed_record[self.replication_keys[0]]
-                    )
-                except KeyError as _:
-                    LOGGER.error(
-                        "Unable to process Record, Exception occurred: %s for stream %s",
-                        _,
-                        self.__class__,
-                    )
-                    continue
-                if record_timestamp >= bookmark_date_to_utc:
-                    write_record(self.tap_stream_id, transformed_record)
+                self.append_times_to_dates(transformed_record)
+
+                record_timestamp = transformed_record[self.replication_keys[0]]
+                if record_timestamp >= bookmark_date:
+                    if self.is_selected:
+                        write_record(self.tap_stream_id, transformed_record)
+                        counter.increment()
+
                     current_max_bookmark_date = max(
                         current_max_bookmark_date, record_timestamp
                     )
-                    counter.increment()
 
-            state = self.write_bookmark(
-                state, value=strftime(current_max_bookmark_date)
-            )
+                    for child in self.child_to_sync:
+                        child.sync(state=state, transformer=transformer, parent_obj=record)
+
+            state = self.write_bookmark(state, value=current_max_bookmark_date)
             return counter.value
 
 
 class FullTableStream(BaseStream):
     """Base Class for Incremental Stream."""
 
-    replication_method = "FULL_TABLE"
-    forced_replication_method = "FULL_TABLE"
-    valid_replication_keys = None
-    replication_keys = None
-
-    total_records = 0
-
     def sync(
-        self, state: Dict, schema: Dict, stream_metadata: Dict, transformer: Transformer
+        self,
+        state: Dict,
+        transformer: Transformer,
+        parent_obj: Dict = None,
     ) -> Dict:
         """Abstract implementation for `type: Fulltable` stream."""
+        self.url_endpoint = self.get_url_endpoint()
         with metrics.record_counter(self.tap_stream_id) as counter:
             for record in self.get_records():
                 transformed_record = transformer.transform(
-                    record, schema, stream_metadata
+                    record, self.schema, self.metadata
                 )
-                write_record(self.tap_stream_id, transformed_record)
-                counter.increment()
+                if self.is_selected:
+                    write_record(self.tap_stream_id, transformed_record)
+                    counter.increment()
+
+                for child in self.child_to_sync:
+                    child.sync(state=state, transformer=transformer, parent_obj=record)
+
             return counter.value
+

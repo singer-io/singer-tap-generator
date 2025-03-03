@@ -6,25 +6,26 @@ jobs:
     steps:
       - checkout
       - run:
-          name: 'Setup virtual env'
+          name: "Setup virtual env"
           command: |
             python3 -mvenv /usr/local/share/virtualenvs/tap-{{ config.tap_name|lower }}
             source /usr/local/share/virtualenvs/tap-{{ config.tap_name|lower }}/bin/activate
-            pip install -U 'pip==22.2.2' 'setuptools==65.3.0'
+            pip install -U "pip==22.2.2" "setuptools==65.3.0"
             pip install .[dev]
       - run:
-          name: 'JSON Validator'
+          name: "JSON Validator"
           command: |
             source /usr/local/share/virtualenvs/tap-tester/bin/activate
             stitch-validate-json {{tap_name}}/schemas/*.json
       - run:
-          name: 'pylint'
+          name: "pylint"
           command: |
             source /usr/local/share/virtualenvs/tap-{{ config.tap_name|lower }}/bin/activate
+            pip install pylint
             pylint {{tap_name}} -d C,R,W
       - add_ssh_keys
       - run:
-          name: 'Unit Tests'
+          name: "Unit Tests"
           command: |
             source /usr/local/share/virtualenvs/tap-{{ config.tap_name|lower }}/bin/activate
             pip install nose coverage
@@ -35,7 +36,7 @@ jobs:
       - store_artifacts:
           path: htmlcov
       - run:
-          name: 'Integration Tests'
+          name: "Integration Tests"
           command: |
             aws s3 cp s3://com-stitchdata-dev-deployment-assets/environments/tap-tester/tap_tester_sandbox dev_env.sh
             source dev_env.sh
