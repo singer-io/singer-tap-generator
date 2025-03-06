@@ -22,12 +22,12 @@ class {{config.tap_name}}BaseTest(BaseCase):
     @staticmethod
     def tap_name():
         """The name of the tap."""
-        return 'tap-{{ config.tap_name|lower }}'
+        return "tap-{{ config.tap_name|lower }}"
     
     @staticmethod
     def get_type():
         """The name of the tap."""
-        return 'platform.{{ config.tap_name|lower }}'
+        return "platform.{{ config.tap_name|lower }}"
 
     @classmethod
     def expected_metadata(cls):
@@ -35,10 +35,10 @@ class {{config.tap_name}}BaseTest(BaseCase):
         return {
             {% for stream in config.streams %}
             "{{ stream.name }}": {
-                cls.PRIMARY_KEYS: { {{stream.key_properties|join(', ')|tojson}} },
+                cls.PRIMARY_KEYS: { {{stream.key_properties|join(", ")|tojson}} },
                 cls.REPLICATION_METHOD: cls.{{ stream.get("replication_method", "FULL_TABLE") }},
                 {% if stream.get("replication_keys") %}
-                cls.REPLICATION_KEYS: { {{stream.replication_keys|join(', ')|tojson}} },
+                cls.REPLICATION_KEYS: { {{stream.replication_keys|join(", ")|tojson}} },
                 {% else %}
                 cls.REPLICATION_KEYS: set(),
                 {% endif %}

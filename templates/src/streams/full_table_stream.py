@@ -1,15 +1,13 @@
 from typing import Dict, Iterator, List
-
-from singer import Transformer, get_logger, metrics, write_record
-from singer.utils import strftime, strptime_to_utc
-
+from singer import get_logger
 from {{tap_name}}.streams.abstracts import FullTableStream
 
 LOGGER = get_logger()
 
+
 class {{ stream.name|camel_case }}(FullTableStream):
     tap_stream_id = "{{ stream.name }}"
-    key_properties = {{ stream.key_properties }}
+    key_properties = {{ stream.key_properties| tojson }}
     replication_method = "FULL_TABLE"
     {% if stream.data_key %}
     data_key = "{{ stream.data_key }}"
@@ -18,7 +16,7 @@ class {{ stream.name|camel_case }}(FullTableStream):
     url_endpoint = "{{ stream.url_endpoint }}"
     {% endif %}
     {% if stream.params %}
-    params = {{ stream.params }}
+    params = {{ stream.params| tojson }}
     {% endif %}
     {% if stream.page_size %}
     page_size = {{ stream.page_size }}
@@ -33,5 +31,5 @@ class {{ stream.name|camel_case }}(FullTableStream):
     path = "{{ stream.parent }}"
     {% endif %}
     {% if stream.children %}
-    path = "{{ stream.children }}"
+    children = "{{ stream.children }}"
     {% endif %}

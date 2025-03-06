@@ -1,6 +1,5 @@
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Tuple, List
-
 from singer import (
     Transformer,
     get_bookmark,
@@ -11,7 +10,6 @@ from singer import (
     write_schema,
     metadata
 )
-from singer.utils import strftime, strftime, strptime_with_tz
 
 LOGGER = get_logger()
 
@@ -70,8 +68,7 @@ class BaseStream(ABC):
     def key_properties(self) -> Tuple[str, str]:
         """List of key properties for stream."""
 
-    @classmethod
-    def is_selected(cls):
+    def is_selected(self):
         return metadata.get(self.metadata, (), "selected")
 
     @abstractmethod
@@ -149,21 +146,26 @@ class IncrementalStream(BaseStream):
     """Base Class for Incremental Stream."""
 
 
-    def get_bookmark(self, state: dict, key: Any = None) -> int:
+    def get_bookmark(self, state: dict, stream: str, key: Any = None) -> int:
         """A wrapper for singer.get_bookmark to deal with compatibility for
         bookmark values or start values."""
         return get_bookmark(
             state,
-            self.tap_stream_id,
+            stream,
             key or self.replication_keys[0],
-            self.client.config.get("start_date", False),
+            self.client.config["start_date"],
         )
 
-    def write_bookmark(self, state: dict, key: Any = None, value: Any = None) -> Dict:
+    def write_bookmark(self, state: dict, stream: str, key: Any = None, value: Any = None) -> Dict:
         """A wrapper for singer.get_bookmark to deal with compatibility for
         bookmark values or start values."""
+        if not (key or self.replication_keys):
+            return state
+
+        current_bookmark = get_bookmark(state, stream, key or self.replication_keys[0], self.client.config["start_date"])
+        value = max(current_bookmark, value)
         return write_bookmark(
-            state, self.tap_stream_id, key or self.replication_keys[0], value
+            state, stream, key or self.replication_keys[0], value
         )
 
 
@@ -174,8 +176,8 @@ class IncrementalStream(BaseStream):
         parent_obj: Dict = None,
     ) -> Dict:
         """Implementation for `type: Incremental` stream."""
-        current_max_bookmark_date = bookmark_date = self.get_bookmark(state)
-        self.update_params(updated_since=bookmark_date)
+        current_max_bookmark_date = bookmark_date = self.get_bookmark(state, self.tap_stream_id)
+        self.update_params(updated_since=bookmark_date) # TODO
         self.url_endpoint = self.get_url_endpoint(parent_obj)
 
         with metrics.record_counter(self.tap_stream_id) as counter:
@@ -188,7 +190,7 @@ class IncrementalStream(BaseStream):
 
                 record_timestamp = transformed_record[self.replication_keys[0]]
                 if record_timestamp >= bookmark_date:
-                    if self.is_selected:
+                    if self.is_selected():
                         write_record(self.tap_stream_id, transformed_record)
                         counter.increment()
 
@@ -199,7 +201,7 @@ class IncrementalStream(BaseStream):
                     for child in self.child_to_sync:
                         child.sync(state=state, transformer=transformer, parent_obj=record)
 
-            state = self.write_bookmark(state, value=current_max_bookmark_date)
+            state = self.write_bookmark(state, self.tap_stream_id, value=current_max_bookmark_date)
             return counter.value
 
 

@@ -9,7 +9,7 @@ This tap:
 - Pulls raw data from the [{{config.tap_name}} API].
 - Extracts the following resources:
     {% for stream in config.streams %}
-    - [{{stream.name|camel_case}}]({{ stream.doc_link if stream.doc_link else https://github.com/singer-io}})
+    - [{{stream.name|camel_case}}]({{ stream.doc_link if stream.doc_link else 'https://github.com/singer-io'}})
 
     {% endfor %}
 - Outputs the schema for each resource
@@ -20,7 +20,7 @@ This tap:
 
 
 {% for stream in config.streams %}
-** [{{stream.name}}]({{ stream.doc_link if stream.doc_link else https://github.com/singer-io}})**
+** [{{stream.name}}]({{ stream.doc_link if stream.doc_link else 'https://github.com/singer-io'}})**
 {% if stream.url_endpoint %}
 - Endpoint: {{ stream.url_endpoint }}
 {% endif %}

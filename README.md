@@ -1,6 +1,6 @@
 # Singer Tap Generator
 
-A powerful command-line tool for generating [Singer](https://www.singer.io/) tap connectors. This tool automates the creation of Singer tap boilerplate code, helping developers quickly start building singer connectorco.
+A powerful command-line tool for generating [Singer](https://www.singer.io/) tap connectors. This tool automates the creation of Singer tap boilerplate code, helping developers quickly start building singer connector.
 
 
 
@@ -19,28 +19,72 @@ pip install jinja2
 
 ## Quick Start
 
-1. Create a configuration file `config.json`:
+1. Create a configuration file `template_config.json`:
 
 ```json
 {
-  "tap_name": "example",
-  "api_url": "https://api.example.com",
-  "auth_method": "oauth2",
+  "tap_name": "Harvest",
+  "required_config_keys": ["refresh_token", "client_id", "client_secret", "start_date", "user_agent"],
+  "page_size": 100,
+  "next_page_key": "next_page",
+  "pagination_key": "page",
+  "headers": {"Accept": "application/json"},
+  "params": {},
+  "auth_header_key": "Authorization",
+  "auth_config_key": "access_token",
+  "base_url": "https://api.harvestapp.com/v2/",
   "streams": [
     {
-      "name": "users",
-      "path": "/users",
-      "replication_method": "INCREMENTAL",
-      "replication_key": "updated_at",
-      ...
+      "name": "projects",
+      "key_properties": ["id"],
+      "replication_method": "FULL_TABLE",
+      "path": "projects",
+      "data_key": "projects",
+      "doc_link": "https://help.getharvest.com/api-v2/projects-api/projects/projects/"
     },
     {
-      "name": "posts",
-      "path": "/posts",
-      "replication_method": "FULL_TABLE",
-      ...
+      "name": "clients",
+      "key_properties": ["id"],
+      "replication_method": "INCREMENTAL",
+      "replication_keys": ["updated_at"],
+      "path": "clients",
+      "data_key": "clients",
+      "url_endpoint": "https://api.harvestapp.com/v2/clients",
+      "doc_link": "https://help.getharvest.com/api-v2/clients-api/clients/clients/"
+    },
+    {
+      "name": "invoice_payments",
+      "key_properties": ["id"],
+      "replication_method": "INCREMENTAL",
+      "replication_keys": ["updated_at"],
+      "path": "invoices/{}/payments",
+      "data_key": "invoice_payments",
+      "parent": "invoices",
+      "doc_link": "https://help.getharvest.com/api-v2/invoices-api/invoices/invoice-payments/"
+    },
+    {
+      "name": "invoices",
+      "key_properties": ["id"],
+      "replication_method": "INCREMENTAL",
+      "replication_keys": ["updated_at"],
+      "path": "invoices",
+      "data_key": "invoices",
+      "children": ["invoice_payments", "invoice_messages", "invoice_line_items"],
+      "doc_link": "https://help.getharvest.com/api-v2/invoices-api/invoices/invoices/"
     }
+    ...
   ],
+  "tap_tester_creds": {
+    "client_id": "TAP_HARVEST_CLIENT_ID",
+    "client_secret": "TAP_HARVEST_CLIENT_SECRET",
+    "refresh_token": "TAP_HARVEST_REFRESH_TOKEN"
+    ...
+  },
+  "author": "Stitch",
+  "third_party_dependencies": [
+      "singer-python==5.12.1",
+      "requests==2.31.0"
+  ]
   ...
 }
 ```
@@ -48,12 +92,12 @@ pip install jinja2
 2. Generate the tap:
 
 ```bash
-singer-generator -c config.json -o output_dir
+python3 singer_generator.py -c template_config.json -o output_dir
 ```
 
 ## Configuration File
 
-The configuration file (`config.json`) defines the structure of your Singer tap.
+The configuration file (`template_config.json`) defines the structure of your Singer tap.
 detailed breakdown of the available options:
 
 ### Root Level Configuration
@@ -71,5 +115,9 @@ detailed breakdown of the available options:
 | key_properties | array |  Primary key fields  | Yes |
 | replication_keys | array |  Fields used for incremental replication | Yes |
 | replication_method | string | FULL_TABLE or INCREMENTAL | Yes |
-| endpoint | string | API endpoint url | Yes |
+| url_endpoint | string | API endpoint url | Yes |
+| path | string  | Endpoint path the needs to be added with base_url | No |
 | data_key | string  | Key for records in API response | No |
+| parent | string  | Parent of current stream | No |
+| children | array  | Children of current stream | No |
+| doc_link | string  | Documentation link for the current stream endpoint | No |

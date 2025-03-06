@@ -45,6 +45,9 @@ TEST_FILES = {
     "tests/test_interrupted_sync.py": "test_interrupted_sync.py",  # Sync interruption tests
 }
 
+def camel_case(s):
+    parts = s.split('_')
+    return ''.join(word.capitalize() for word in parts)
 
 class SingerTapGenerator:
     """
@@ -80,7 +83,7 @@ class SingerTapGenerator:
             line_comment_prefix="#",  # Use Python-style comments
             extensions=["jinja2.ext.do"],  # Enable loop extensions
         )
-
+        self.env.filters['camel_case'] = camel_case
         # Load and parse configuration
         with open(config_path, "r") as f:
             self.config = json.load(f)
@@ -109,7 +112,7 @@ class SingerTapGenerator:
                 self.project_dir, self.tap_name, "streams"
             ),  # Stream implementations
             self.test_dir,
-            os.path.join(self.test_dir, "unit_tests"),
+            os.path.join(self.test_dir, "unittests"),
             os.path.join(self.project_dir, ".circleci"),  # CircleCI configuration
         ]
 

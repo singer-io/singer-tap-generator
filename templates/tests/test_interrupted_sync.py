@@ -18,10 +18,10 @@ class {{config.tap_name}}InterruptedSyncTest({{config.tap_name}}BaseTest):
     def manipulate_state(self):
         return {
             "currently_syncing": "prospects",
-            'bookmarks': {
+            "bookmarks": {
                 {% for stream in config.streams %}
                 {% if stream.get("replication_keys") %}
-                "{{ stream.name }}": { '{{stream.replication_keys[0]}}' : "2020-01-01T00:00:00Z"},
+                "{{ stream.name }}": { "{{stream.replication_keys[0]}}" : "2020-01-01T00:00:00Z"},
                 {% endif %}
                 {% endfor %}
         }

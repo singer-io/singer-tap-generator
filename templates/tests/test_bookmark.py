@@ -7,10 +7,10 @@ class {{config.tap_name}}BookMarkTest(BookmarkTest, {{config.tap_name}}BaseTest)
     stream."""
     bookmark_format = "%Y-%m-%dT%H:%M:%S.%fZ"
     initial_bookmarks = {
-        'bookmarks': {
+        "bookmarks": {
             {% for stream in config.streams %}
             {% if stream.get("replication_keys") %}
-            "{{ stream.name }}": { '{{stream.replication_keys[0]}}' : "2020-01-01T00:00:00Z"},
+            "{{ stream.name }}": { "{{stream.replication_keys[0]}}" : "2020-01-01T00:00:00Z"},
             {% endif %}
             {% endfor %}
         }

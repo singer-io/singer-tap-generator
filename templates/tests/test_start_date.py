@@ -17,7 +17,7 @@ class {{config.tap_name}}StartDateTest(StartDateTest, {{config.tap_name}}BaseTes
 
     @property
     def start_date_1(self):
-        return '2015-03-25T00:00:00Z'
+        return "2015-03-25T00:00:00Z"
     @property
     def start_date_2(self):
-        return '2017-01-25T00:00:00Z'
+        return "2017-01-25T00:00:00Z"
