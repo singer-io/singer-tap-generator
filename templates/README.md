@@ -2,7 +2,7 @@
 
 This is a [Singer](https://singer.io) tap that produces JSON-formatted data
 following the [Singer
-spec](https://github.com/singer-io/getting-started/blob/master/SPEC.md).
+spec](https://github.com/singer-io/getting-started/blob/master/docs/SPEC.md#singer-specification).
 
 This tap:
 
@@ -70,7 +70,7 @@ This tap:
         "user_agent": "tap-{{config.tap_name|lower}} <api_user_email@your_company.com>",
         "request_timeout": 300,
         ...
-    }
+    }```
 
     Optionally, also create a `state.json` file. `currently_syncing` is an optional attribute used for identifying the last object to be synced in case the job is interrupted mid-stream. The next run would begin where the last job left off.
 

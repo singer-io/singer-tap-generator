@@ -97,8 +97,8 @@ class BaseStream(ABC):
     def get_records(self) -> List:
         """Interacts with api client interaction and pagination."""
         self.params["{{ config.pagination_key if config.pagination_key else limit }}"] = self.page_size
-
-        while True:
+        next_page = 1
+        while next_page:
             response = self.client.get(
                 self.url_endpoint, self.params, self.headers, self.path
             )
@@ -107,11 +107,8 @@ class BaseStream(ABC):
 
             self.params[self.next_page_key] = next_page
             yield from raw_records
-            if not next_page:
-                break
 
-
-    def write_schema(self):
+    def write_schema(self) -> None:
         """
         Write a schema message.
         """
@@ -123,7 +120,7 @@ class BaseStream(ABC):
             )
             raise err
 
-    def update_params(self, **kwargs):
+    def update_params(self, **kwargs) -> None:
         """
         Update params for the stream
         """
@@ -176,8 +173,9 @@ class IncrementalStream(BaseStream):
         parent_obj: Dict = None,
     ) -> Dict:
         """Implementation for `type: Incremental` stream."""
-        current_max_bookmark_date = bookmark_date = self.get_bookmark(state, self.tap_stream_id)
-        self.update_params(updated_since=bookmark_date) # TODO
+        bookmark_date = self.get_bookmark(state, self.tap_stream_id)
+        current_max_bookmark_date = bookmark_date
+        self.update_params(updated_since=bookmark_date)
         self.url_endpoint = self.get_url_endpoint(parent_obj)
 
         with metrics.record_counter(self.tap_stream_id) as counter:
@@ -215,7 +213,7 @@ class FullTableStream(BaseStream):
         parent_obj: Dict = None,
     ) -> Dict:
         """Abstract implementation for `type: Fulltable` stream."""
-        self.url_endpoint = self.get_url_endpoint()
+        self.url_endpoint = self.get_url_endpoint(parent_obj)
         with metrics.record_counter(self.tap_stream_id) as counter:
             for record in self.get_records():
                 transformed_record = transformer.transform(

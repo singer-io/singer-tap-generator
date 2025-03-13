@@ -15,6 +15,11 @@ cd singer-generator
 
 # Install jinja2 pypi
 pip install jinja2
+
+# Setup pre-commit
+pip install pre-commitpip install pre-commit
+pre-commit
+pre-commit install
 ```
 
 ## Quick Start

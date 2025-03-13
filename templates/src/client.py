@@ -51,10 +51,7 @@ class Client:
 
         # Set and pass request timeout to config param `request_timeout` value.
         config_request_timeout = config.get("request_timeout")
-        if config_request_timeout and float(config_request_timeout):
-            self.request_timeout = float(config_request_timeout)
-        else:
-            self.request_timeout = REQUEST_TIMEOUT # If value is 0,"0","" or not passed then it set default to 300 seconds.
+        self.request_timeout = float(config_request_timeout) if config_request_timeout else REQUEST_TIMEOUT
 
     def __enter__(self):
         self.check_api_credentials()

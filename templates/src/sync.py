@@ -19,7 +19,7 @@ def update_currently_syncing(state: Dict, stream_name: str) -> None:
 
 def write_schema(stream, client, streams_to_sync, catalog) -> None:
     """
-    Collect nested child streams to sync
+    Write schema for stream and its children
     """
     if stream.is_selected():
         stream.write_schema()
@@ -28,6 +28,7 @@ def write_schema(stream, client, streams_to_sync, catalog) -> None:
         child_obj = STREAMS[child](client, catalog.get_stream(child))
         write_schema(child_obj, client, streams_to_sync, catalog)
         if child in streams_to_sync:
+            # Add child stream object to parent stream's child_to_sync
             stream.child_to_sync.append(child_obj)
 
 
@@ -49,11 +50,13 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
 
             stream = STREAMS[stream_name](client, catalog.get_stream(stream_name))
             if stream.parent:
+                # Child stream will be synced with parent stream
                 if stream.parent not in streams_to_sync:
-                    # parent stream is not selected, add it to sync
+                    # Parent stream is not selected, add it to streams_to_sync to sync child stream
                     streams_to_sync.append(stream.parent)
                 continue
 
+            # Write schema for stream and its children
             write_schema(stream, client, streams_to_sync, catalog)
 
             LOGGER.info("START Syncing: {}".format(stream_name))
