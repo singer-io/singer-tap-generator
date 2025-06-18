@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+
+# /// script
+# dependencies = [
+#   "jinja2"
+# ]
+# ///
+
 """
 Singer Tap Generator
 
@@ -202,6 +209,21 @@ class SingerTapGenerator:
             if not os.path.exists(schema_file):
                 with open(schema_file, "w") as f:
                     json.dump({}, f, indent=4)
+
+            # --- PATCH: Normalize key_properties for template compatibility ---
+            # Accept both 'primary_keys' and 'key_properties' in config, prefer 'key_properties', fallback to 'primary_keys'
+            if 'key_properties' not in schema:
+                if 'primary_keys' in schema:
+                    schema['key_properties'] = schema['primary_keys']
+                else:
+                    schema['key_properties'] = []
+            # For incremental streams, ensure 'replication_keys' is set for template
+            if schema.get('replication_method') == 'INCREMENTAL':
+                if 'replication_keys' not in schema:
+                    if 'replication_key' in schema:
+                        schema['replication_keys'] = [schema['replication_key']]
+                    else:
+                        schema['replication_keys'] = []
 
             # Generate stream implementation based on replication method
             stream_file = os.path.join(stream_dir, "streams", f"{schema_name}.py")
