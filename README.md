@@ -1,3 +1,11 @@
+
+### Hackathon instructions TODO: remove later or update readme 
+- [install uv](https://docs.astral.sh/uv/getting-started/installation/)
+- Start up VSCode with Copilot enabled in agent mode
+- Prompt Copilot with something like: "use the INSTRUCTIONS.md to generate a new tap using this api: https://weatherstack.com/documentation"
+- Keep the generated config
+- continue the INSTRUCTIONS.md script and make improvements 
+
 # Singer Tap Generator
 
 A powerful command-line tool for generating [Singer](https://www.singer.io/) tap connectors. This tool automates the creation of Singer tap boilerplate code, helping developers quickly start building singer connector.
