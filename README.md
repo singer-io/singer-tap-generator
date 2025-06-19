@@ -2,9 +2,12 @@
 ### Hackathon instructions TODO: remove later or update readme 
 - [install uv](https://docs.astral.sh/uv/getting-started/installation/)
 - Start up VSCode with Copilot enabled in agent mode
-- Prompt Copilot with something like: "use the INSTRUCTIONS.md to generate a new tap using this api: https://weatherstack.com/documentation"
+- Prompt Copilot with something like: "follow TAP_GENERATION_INSTRUCTIONS.md for this api: https://docs.stripe.com/api"
+- then "now follow RUN_TAP_INSTRUCTIONS.md"
+  - it will probably need to update the schemas
+- then "now follow TESTING_INSTRUCTIONS.md"
 - Keep the generated config
-- continue the INSTRUCTIONS.md script and make improvements 
+- continue updating the  and make improvements 
 
 # Singer Tap Generator
 
