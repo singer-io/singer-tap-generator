@@ -6,8 +6,8 @@
   1. Create a config file (e.g., `my_api_config.json`) with the following structure:
      ```json
      {
-       "tap_name": "my_api",
-       "streams": [
+        "tap_name": "my_api",
+        "streams": [
          {
            "name": "<stream_name>",
            "replication_method": "FULL_TABLE",
@@ -15,18 +15,21 @@
            "key_properties": ["<primary_key_field>"]
          }
          // Add more streams as needed
-       ],
+        ],
+        "required_config_keys": ["<config_key_name>"], // All configuration required to access API
         "tap_tester_creds": {
-            "client_id": "<tap_name>_CLIENT_ID",
-            "client_secret": "<tap_name>_CLIENT_SECRET",
-            "refresh_token": "<tap_name>_REFRESH_TOKEN"
+            "<config_key_name>": "<TAP_NAME>_<CONFIG_KEY_NAME>"
+            // Add more config keys to specify all credentials in `required_config_keys`
        },
      }
      ```
      - Replace `tap_name`, `name`, `endpoint`, and `key_properties` with values appropriate for your API.
-     - `key_properties` list is required.
-     - Use the most appropriate `replication_method` for each stream. Use `replication_key` if the `replication_method` is `INCREMENTAL`
-  
+     - `required_config_keys` list is required and must contain the configuration properties to authenticate with your API
+     - `streams` list is required and contains objects that define configuration for each object available from the API
+     - `key_properties` list is required and contains the primary key fields of a record in the stream.
+     - Use the most appropriate `replication_method` for each stream out of `FULL_TABLE` or `INCREMENTAL`. `INCREMENTAL` is appropriate if there is a datetime value in the stream's fields
+     - The `replication_key` field is required if the stream's`replication_method` is `INCREMENTAL`
+
   2. Run the generator:
      ```bash
      uv run singer_generator.py -c my_api_config.json -o .
