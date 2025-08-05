@@ -50,15 +50,11 @@ def sync(client: Client, config: Dict, catalog: singer.Catalog, state) -> None:
 
             stream = STREAMS[stream_name](client, catalog.get_stream(stream_name))
             if stream.parent:
-                # Child stream will be synced with parent stream
                 if stream.parent not in streams_to_sync:
-                    # Parent stream is not selected, add it to streams_to_sync to sync child stream
                     streams_to_sync.append(stream.parent)
                 continue
 
-            # Write schema for stream and its children
             write_schema(stream, client, streams_to_sync, catalog)
-
             LOGGER.info("START Syncing: {}".format(stream_name))
             update_currently_syncing(state, stream_name)
             total_records = stream.sync(state=state, transformer=transformer)

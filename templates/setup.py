@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-from setuptools import setup
+from setuptools import setup, find_packages
 
 
 setup(name="tap-{{ config.tap_name|lower }}",
@@ -13,13 +13,13 @@ setup(name="tap-{{ config.tap_name|lower }}",
       install_requires=[
         {% for dependency in config.third_party_dependencies %}
         "{{dependency}}",
-        {% endfor %}   
+        {% endfor %}
       ],
       entry_points="""
           [console_scripts]
           tap-{{ config.tap_name|lower }}=tap_{{ config.tap_name|lower }}:main
       """,
-      packages=["tap-{{ config.tap_name|lower }}"],
+      packages=find_packages(),
       package_data = {
           "tap_{{ config.tap_name|lower }}": ["schemas/*.json"],
       },

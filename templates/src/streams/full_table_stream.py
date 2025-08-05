@@ -1,9 +1,4 @@
-from typing import Dict, Iterator, List
-from singer import get_logger
 from {{tap_name}}.streams.abstracts import FullTableStream
-
-LOGGER = get_logger()
-
 
 class {{ stream.name|camel_case }}(FullTableStream):
     tap_stream_id = "{{ stream.name }}"

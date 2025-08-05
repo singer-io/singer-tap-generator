@@ -20,18 +20,19 @@ def raise_for_error(response: requests.Response) -> None:
     """
     try:
         response_json = response.json()
-    except Exception: # pylint: disable=broad-except
+    except Exception:
         response_json = {}
-    if response.status_code != [200, 201, 204]:
+    if response.status_code not in [200, 201, 204]:
         if response_json.get("error"):
-            message = "HTTP-error-code: {}, Error: {}".format(response.status_code, response_json.get("error"))
+            message = f"HTTP-error-code: {response.status_code}, Error: {response_json.get('error')}"
         else:
-            message = "HTTP-error-code: {}, Error: {}".format(
-                response.status_code,
-                response_json.get("message", ERROR_CODE_EXCEPTION_MAPPING.get(
-                    response.status_code, {}).get("message", "Unknown Error")))
-        exc = ERROR_CODE_EXCEPTION_MAPPING.get(
-            response.status_code, {}).get("raise_exception", {{config.tap_name}}Error)
+            error_message = ERROR_CODE_EXCEPTION_MAPPING.get(
+                response.status_code, {}
+            ).get("message", "Unknown Error")
+            message = f"HTTP-error-code: {response.status_code}, Error: {response_json.get('message', error_message)}"
+        exc = ERROR_CODE_EXCEPTION_MAPPING.get(response.status_code, {}).get(
+            "raise_exception", {{config.tap_name}}Error
+        )
         raise exc(message, response) from None
 
 class Client:
@@ -48,8 +49,6 @@ class Client:
         self.config = config
         self._session = session()
         self.base_url = "{{ config.base_url if config.base_url else "" }}"
-
-        # Set and pass request timeout to config param `request_timeout` value.
         config_request_timeout = config.get("request_timeout")
         self.request_timeout = float(config_request_timeout) if config_request_timeout else REQUEST_TIMEOUT
 
@@ -68,17 +67,38 @@ class Client:
         headers["{{ config.auth_header_key if config.auth_header_key else auth_header_key }}"] = self.config["{{ config.auth_config_key if config.auth_config_key else auth_config_key }}"]
         return headers, params
 
-    def get(self, endpoint: str, params: Dict, headers: Dict, path: str = None) -> Any:
+    def get(
+        self, endpoint: str, params: Dict = {}, headers: Dict = {}, path: str = None
+    ) -> Any:
         """Calls the make_request method with a prefixed method type `GET`"""
         endpoint = endpoint or f"{self.base_url}/{path}"
         headers, params = self.authenticate(headers, params)
-        return self.__make_request("GET", endpoint, headers=headers, params=params, timeout=self.request_timeout)
+        return self.__make_request(
+            "GET",
+            endpoint,
+            headers=headers,
+            params=params,
+            timeout=self.request_timeout,
+        )
 
-    def post(self, endpoint: str, params: Dict, headers: Dict, body: Dict, path: str = None) -> Any:
+    def post(
+        self,
+        endpoint: str,
+        params: Dict = {},
+        headers: Dict = {},
+        body: Dict = {},
+        path: str = None,
+    ) -> Any:
         """Calls the make_request method with a prefixed method type `POST`"""
-        # pylint: disable=R0913
-        headers, params = self.authenticate(headers, params)
-        self.__make_request("POST", endpoint, headers=headers, params=params, data=body, timeout=self.request_timeout)
+        endpoint = endpoint or f"{self.base_url}/{path}"
+        return self.__make_request(
+            "POST",
+            endpoint,
+            headers=headers,
+            params=params,
+            data=body,
+            timeout=self.request_timeout,
+        )
 
 
     @backoff.on_exception(
@@ -93,21 +113,13 @@ class Client:
         max_tries=5,
         factor=2,
     )
-    def __make_request(self, method: str, endpoint: str, **kwargs) -> Optional[Mapping[Any, Any]]:
-        """
-        Performs HTTP Operations
-        Args:
-            method (str): represents the state file for the tap.
-            endpoint (str): url of the resource that needs to be fetched
-            params (dict): A mapping for url params eg: ?name=Avery&age=3
-            headers (dict): A mapping for the headers that need to be sent
-            body (dict): only applicable to post request, body of the request
-
-        Returns:
-            Dict,List,None: Returns a `Json Parsed` HTTP Response or None if exception
-        """
-        with metrics.http_request_timer(endpoint) as timer:
+    def __make_request(
+        self, method: str, endpoint: str, **kwargs
+    ) -> Optional[Mapping[Any, Any]]:
+        """Performs HTTP Operations."""
+        with metrics.http_request_timer(endpoint):
             response = self._session.request(method, endpoint, **kwargs)
             raise_for_error(response)
 
         return response.json()
+

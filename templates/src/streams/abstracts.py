@@ -184,16 +184,15 @@ class IncrementalStream(BaseStream):
                 transformed_record = transformer.transform(
                     record, self.schema, self.metadata
                 )
-                self.append_times_to_dates(transformed_record)
 
-                record_timestamp = transformed_record[self.replication_keys[0]]
-                if record_timestamp >= bookmark_date:
+                record_bookmark = transformed_record[self.replication_keys[0]]
+                if record_bookmark >= bookmark_date:
                     if self.is_selected():
                         write_record(self.tap_stream_id, transformed_record)
                         counter.increment()
 
                     current_max_bookmark_date = max(
-                        current_max_bookmark_date, record_timestamp
+                        current_max_bookmark_date, record_bookmark
                     )
 
                     for child in self.child_to_sync:
@@ -205,6 +204,8 @@ class IncrementalStream(BaseStream):
 
 class FullTableStream(BaseStream):
     """Base Class for Incremental Stream."""
+
+    replication_keys = []
 
     def sync(
         self,
@@ -228,3 +229,58 @@ class FullTableStream(BaseStream):
 
             return counter.value
 
+
+class ParentBaseStream(IncrementalStream):
+    """Base Class for Parent Stream."""
+
+    def get_bookmark(self, state: Dict, stream: str, key: Any = None) -> int:
+        """A wrapper for singer.get_bookmark to deal with compatibility for
+        bookmark values or start values."""
+
+        min_parent_bookmark = (
+            super().get_bookmark(state, stream) if self.is_selected() else None
+        )
+        for child in self.child_to_sync:
+            bookmark_key = f"{self.tap_stream_id}_{self.replication_keys[0]}"
+            child_bookmark = super().get_bookmark(
+                state, child.tap_stream_id, key=bookmark_key
+            )
+            min_parent_bookmark = (
+                min(min_parent_bookmark, child_bookmark)
+                if min_parent_bookmark
+                else child_bookmark
+            )
+
+        return min_parent_bookmark
+
+    def write_bookmark(
+        self, state: Dict, stream: str, key: Any = None, value: Any = None
+    ) -> Dict:
+        """A wrapper for singer.get_bookmark to deal with compatibility for
+        bookmark values or start values."""
+        if self.is_selected():
+            super().write_bookmark(state, stream, value=value)
+
+        for child in self.child_to_sync:
+            bookmark_key = f"{self.tap_stream_id}_{self.replication_keys[0]}"
+            super().write_bookmark(
+                state, child.tap_stream_id, key=bookmark_key, value=value
+            )
+
+        return state
+
+
+class ChildBaseStream(IncrementalStream):
+    """Base Class for Child Stream."""
+
+    def get_url_endpoint(self, parent_obj=None):
+        """Prepare URL endpoint for child streams."""
+        return f"{self.client.base_url}/{self.path.format(parent_obj['id'])}"
+
+    def get_bookmark(self, state: Dict, stream: str, key: Any = None) -> int:
+        """Singleton bookmark value for child streams."""
+        if not self.bookmark_value:
+            # Set bookmark value as singleton
+            self.bookmark_value = super().get_bookmark(state, stream)
+
+        return self.bookmark_value

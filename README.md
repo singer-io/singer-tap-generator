@@ -17,7 +17,7 @@ cd singer-generator
 pip install jinja2
 
 # Setup pre-commit
-pip install pre-commitpip install pre-commit
+pip install pre-commit
 pre-commit
 pre-commit install
 ```

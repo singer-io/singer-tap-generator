@@ -2,7 +2,7 @@
 
 This is a [Singer](https://singer.io) tap that produces JSON-formatted data
 following the [Singer
-spec](https://github.com/singer-io/getting-started/blob/master/docs/SPEC.md#singer-specification).
+spec](https://github.com/singer-io/getting-started/blob/master/docs/SPEC.md).
 
 This tap:
 
@@ -91,9 +91,11 @@ This tap:
     tap-{{config.tap_name|lower}} --config config.json --discover > catalog.json
     ```
    See the Singer docs on discovery mode
-   [here](https://github.com/singer-io/getting-started/blob/master/docs/DISCOVERY_MODE.md#discovery-mode).
+   {% set discovery_url = "https://github.com/singer-io/getting-started/blob/master/docs/DISCOVERY_MODE.md#discovery-mode" %}
+   [here]({{ discovery_url }}).
 
-5. Run the Tap in Sync Mode (with catalog) and [write out to state file](https://github.com/singer-io/getting-started/blob/master/docs/RUNNING_AND_DEVELOPING.md#running-a-singer-tap-with-a-singer-target)
+{% set state_url = "https://github.com/singer-io/getting-started/blob/master/docs/RUNNING_AND_DEVELOPING.md#running-a-singer-tap-with-a-singer-target" %}
+5. Run the Tap in Sync Mode (with catalog) and [write out to state file]({{ state_url }})
 
     For Sync mode:
     ```bash
@@ -114,7 +116,8 @@ This tap:
 6. Test the Tap
     
     While developing the {{config.tap_name|lower}} tap, the following utilities were run in accordance with Singer.io best practices:
-    Pylint to improve [code quality](https://github.com/singer-io/getting-started/blob/master/docs/BEST_PRACTICES.md#code-quality):
+    {% set code_quality_url = "https://github.com/singer-io/getting-started/blob/master/docs/BEST_PRACTICES.md#code-quality" %}
+    Pylint to improve [code quality]({{ code_quality_url }}):
     ```bash
     > pylint tap_{{config.tap_name|lower}} -d missing-docstring -d logging-format-interpolation -d too-many-locals -d too-many-arguments
     ```
@@ -123,7 +126,8 @@ This tap:
     Your code has been rated at 9.67/10
     ```
 
-    To [check the tap](https://github.com/singer-io/singer-tools#singer-check-tap) and verify working:
+    {% set singer_check_url = "https://github.com/singer-io/singer-tools#singer-check-tap"  %}
+    To [check the tap]({{ singer_check_url }}) and verify working:
     ```bash
     > tap_{{config.tap_name|lower}} --config tap_config.json --catalog catalog.json | singer-check-tap > state.json
     > tail -1 state.json > state.json.tmp && mv state.json.tmp state.json
