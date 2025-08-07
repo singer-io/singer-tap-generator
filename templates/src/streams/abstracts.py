@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Tuple, List
+import json
+from typing import Any, Dict, Tuple, List, Iterator
 from singer import (
     Transformer,
     get_bookmark,
@@ -34,6 +35,7 @@ class BaseStream(ABC):
     parent = ""
     data_key = ""
     parent_bookmark_key = ""
+    http_method = "POST"
 
     def __init__(self, client=None, catalog=None) -> None:
         self.client = client
@@ -42,6 +44,7 @@ class BaseStream(ABC):
         self.metadata = metadata.to_map(catalog.metadata)
         self.child_to_sync = []
         self.params = {{config.params if config.params else {}}}
+        self.data_payload = {}
 
     @property
     @abstractmethod
@@ -59,7 +62,7 @@ class BaseStream(ABC):
 
     @property
     @abstractmethod
-    def replication_keys(self) -> str:
+    def replication_keys(self) -> List:
         """Defines the replication key for incremental sync mode of a
         stream."""
 
@@ -94,13 +97,13 @@ class BaseStream(ABC):
         """
 
 
-    def get_records(self) -> List:
+    def get_records(self) -> Iterator:
         """Interacts with api client interaction and pagination."""
         self.params["{{ config.pagination_key if config.pagination_key else limit }}"] = self.page_size
         next_page = 1
         while next_page:
-            response = self.client.get(
-                self.url_endpoint, self.params, self.headers, self.path
+            response = self.client.make_request(
+                self.http_method, self.url_endpoint, self.params, self.headers, body=json.dumps(self.data_payload), path=self.path
             )
             raw_records = response.get(self.data_key, [])
             next_page = response.get(self.next_page_key)
@@ -125,6 +128,12 @@ class BaseStream(ABC):
         Update params for the stream
         """
         self.params.update(kwargs)
+
+    def update_data_payload(self, **kwargs) -> None:
+        """
+        Update JSON body for the stream
+        """
+        self.data_payload.update(kwargs)
 
     def modify_object(self, record: Dict, parent_record: Dict = None) -> Dict:
         """
@@ -176,6 +185,7 @@ class IncrementalStream(BaseStream):
         bookmark_date = self.get_bookmark(state, self.tap_stream_id)
         current_max_bookmark_date = bookmark_date
         self.update_params(updated_since=bookmark_date)
+        self.update_data_payload(parent_obj)
         self.url_endpoint = self.get_url_endpoint(parent_obj)
 
         with metrics.record_counter(self.tap_stream_id) as counter:
@@ -215,12 +225,13 @@ class FullTableStream(BaseStream):
     ) -> Dict:
         """Abstract implementation for `type: Fulltable` stream."""
         self.url_endpoint = self.get_url_endpoint(parent_obj)
+        self.update_data_payload(parent_obj)
         with metrics.record_counter(self.tap_stream_id) as counter:
             for record in self.get_records():
                 transformed_record = transformer.transform(
                     record, self.schema, self.metadata
                 )
-                if self.is_selected:
+                if self.is_selected():
                     write_record(self.tap_stream_id, transformed_record)
                     counter.increment()
 

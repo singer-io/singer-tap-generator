@@ -67,39 +67,24 @@ class Client:
         headers["{{ config.auth_header_key if config.auth_header_key else auth_header_key }}"] = self.config["{{ config.auth_config_key if config.auth_config_key else auth_config_key }}"]
         return headers, params
 
-    def get(
-        self, endpoint: str, params: Dict = {}, headers: Dict = {}, path: str = None
+    def make_request(
+        self,
+        method: str,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, Any]] = None,
+        body: Optional[Dict[str, Any]] = None,
+        path: Optional[str] = None
     ) -> Any:
-        """Calls the make_request method with a prefixed method type `GET`"""
+        """
+        Sends an HTTP request to the specified API endpoint.
+        """
+        params = params or {}
+        headers = headers or {}
+        body = body or {}
         endpoint = endpoint or f"{self.base_url}/{path}"
         headers, params = self.authenticate(headers, params)
-        return self.__make_request(
-            "GET",
-            endpoint,
-            headers=headers,
-            params=params,
-            timeout=self.request_timeout,
-        )
-
-    def post(
-        self,
-        endpoint: str,
-        params: Dict = {},
-        headers: Dict = {},
-        body: Dict = {},
-        path: str = None,
-    ) -> Any:
-        """Calls the make_request method with a prefixed method type `POST`"""
-        endpoint = endpoint or f"{self.base_url}/{path}"
-        return self.__make_request(
-            "POST",
-            endpoint,
-            headers=headers,
-            params=params,
-            data=body,
-            timeout=self.request_timeout,
-        )
-
+        return self.__make_request(method, endpoint, headers=headers, params=params, data=body, timeout=self.request_timeout)
 
     @backoff.on_exception(
         wait_gen=backoff.expo,
@@ -118,8 +103,13 @@ class Client:
     ) -> Optional[Mapping[Any, Any]]:
         """Performs HTTP Operations."""
         with metrics.http_request_timer(endpoint):
-            response = self._session.request(method, endpoint, **kwargs)
-            raise_for_error(response)
+            if method in ("GET", "POST"):
+                if method == "GET":
+                    kwargs.pop("data", None)
+                response = self._session.request(method, endpoint, **kwargs)
+                raise_for_error(response)
+            else:
+                raise ValueError(f"Unsupported method: {method}")
 
         return response.json()
 
