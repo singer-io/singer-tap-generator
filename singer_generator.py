@@ -48,6 +48,8 @@ TEST_FILES = {
 UNITTEST_FILES = {
     "tests/unittests/test_client.py": "test_client.py",
     "tests/unittests/test_sync.py": "test_sync.py",
+    "tests/unittests/test_parent_child_bookmark.py": "test_parent_child_bookmark.py",
+    "tests/unittests/test_incremental_sync.py": "test_incremental_sync.py",
 }
 
 def camel_case(s):

@@ -29,11 +29,11 @@ class {{config.tap_name}}NotFoundError({{config.tap_name}}Error):
     pass
 
 class {{config.tap_name}}ConflictError({{config.tap_name}}Error):
-    """class representing 406 status code."""
+    """class representing 409 status code."""
     pass
 
 class {{config.tap_name}}UnprocessableEntityError({{config.tap_name}}BackoffError):
-    """class representing 409 status code."""
+    """class representing 422 status code."""
     pass
 
 class {{config.tap_name}}RateLimitError({{config.tap_name}}BackoffError):
