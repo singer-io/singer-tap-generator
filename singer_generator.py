@@ -45,6 +45,11 @@ TEST_FILES = {
     "tests/test_interrupted_sync.py": "test_interrupted_sync.py",  # Sync interruption tests
 }
 
+UNITTEST_FILES = {
+    "tests/unittests/test_client.py": "test_client.py",
+    "tests/unittests/test_sync.py": "test_sync.py",
+}
+
 def camel_case(s):
     parts = s.split('_')
     return ''.join(word.capitalize() for word in parts)
@@ -156,6 +161,9 @@ class SingerTapGenerator:
 
         # Generate schemas and stream implementations
         self._generate_schemas_and_streams(tap_dir)
+        
+        # Generate unit tests
+        self._generate_files(UNITTEST_FILES, os.path.join(self.test_dir, "unittests"))
 
     def _generate_files(self, file_map: Dict[str, str], output_dir: str) -> None:
         """
