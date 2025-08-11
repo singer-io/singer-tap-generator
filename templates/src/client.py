@@ -102,6 +102,7 @@ class Client:
         self, method: str, endpoint: str, **kwargs
     ) -> Optional[Mapping[Any, Any]]:
         """Performs HTTP Operations."""
+        method = method.upper()
         with metrics.http_request_timer(endpoint):
             if method in ("GET", "POST"):
                 if method == "GET":
