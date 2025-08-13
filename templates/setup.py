@@ -4,7 +4,7 @@ from setuptools import setup, find_packages
 
 
 setup(name="tap-{{ config.tap_name|lower }}",
-      version="1.0.0",
+      version="0.0.1",
       description="Singer.io tap for extracting data from {{ config.tap_name }} API",
       author="{{config.author if config.author else Stitch}}",
       url="http://singer.io",
