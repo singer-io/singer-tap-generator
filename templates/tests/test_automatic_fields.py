@@ -15,3 +15,4 @@ class {{config.tap_name}}AutomaticFields(MinimumSelectionTest, {{config.tap_name
     def streams_to_test(self):
         streams_to_exclude = {}
         return self.expected_stream_names().difference(streams_to_exclude)
+

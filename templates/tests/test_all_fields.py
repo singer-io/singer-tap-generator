@@ -17,3 +17,4 @@ class {{config.tap_name}}AllFields(AllFieldsTest, {{config.tap_name}}BaseTest):
     def streams_to_test(self):
         streams_to_exclude = {}
         return self.expected_stream_names().difference(streams_to_exclude)
+

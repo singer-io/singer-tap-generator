@@ -73,3 +73,4 @@ def get_schemas() -> Tuple[Dict, Dict]:
         field_metadata[stream_name] = mdata
 
     return schemas, field_metadata
+

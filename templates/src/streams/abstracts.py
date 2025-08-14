@@ -103,7 +103,12 @@ class BaseStream(ABC):
         next_page = 1
         while next_page:
             response = self.client.make_request(
-                self.http_method, self.url_endpoint, self.params, self.headers, body=json.dumps(self.data_payload), path=self.path
+                self.http_method,
+                self.url_endpoint,
+                self.params,
+                self.headers,
+                body=json.dumps(self.data_payload),
+                path=self.path
             )
             raw_records = response.get(self.data_key, [])
             next_page = response.get(self.next_page_key)
@@ -294,3 +299,4 @@ class ChildBaseStream(IncrementalStream):
             self.bookmark_value = super().get_bookmark(state, stream)
 
         return self.bookmark_value
+

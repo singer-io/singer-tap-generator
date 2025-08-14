@@ -20,7 +20,7 @@ This tap:
 
 
 {% for stream in config.streams %}
-** [{{stream.name}}]({{ stream.doc_link if stream.doc_link else 'https://github.com/singer-io'}})**
+**[{{stream.name}}]({{ stream.doc_link if stream.doc_link else 'https://github.com/singer-io'}})**
 {% if stream.url_endpoint %}
 - Endpoint: {{ stream.url_endpoint }}
 {% endif %}
@@ -54,7 +54,7 @@ This tap:
     > pip install singer-python
     > pip install target-stitch
     > pip install target-json
-    
+
     ```
     - [singer-tools](https://github.com/singer-io/singer-tools)
     - [target-stitch](https://github.com/singer-io/target-stitch)
@@ -63,13 +63,12 @@ This tap:
    - `start_date` - the default value to use if no bookmark exists for an endpoint (rfc3339 date string)
    - `user_agent` (string, optional): Process and email for API logging purposes. Example: `tap-{{config.tap_name|lower}} <api_user_email@your_company.com>`
    - `request_timeout` (integer, `300`): Max time for which request should wait to get a response. Default request_timeout is 300 seconds.
-   
+
     ```json
     {
         "start_date": "2019-01-01T00:00:00Z",
         "user_agent": "tap-{{config.tap_name|lower}} <api_user_email@your_company.com>",
-        "request_timeout": 300,
-        ...
+        "request_timeout": 300
     }```
 
     Optionally, also create a `state.json` file. `currently_syncing` is an optional attribute used for identifying the last object to be synced in case the job is interrupted mid-stream. The next run would begin where the last job left off.
@@ -114,7 +113,6 @@ This tap:
     ```
 
 6. Test the Tap
-    
     While developing the {{config.tap_name|lower}} tap, the following utilities were run in accordance with Singer.io best practices:
     {% set code_quality_url = "https://github.com/singer-io/getting-started/blob/master/docs/BEST_PRACTICES.md#code-quality" %}
     Pylint to improve [code quality]({{ code_quality_url }}):

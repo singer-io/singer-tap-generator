@@ -12,3 +12,4 @@ class {{config.tap_name}}DiscoveryTest(DiscoveryTest, {{config.tap_name}}BaseTes
 
     def streams_to_test(self):
         return self.expected_stream_names()
+

@@ -84,7 +84,13 @@ class Client:
         body = body or {}
         endpoint = endpoint or f"{self.base_url}/{path}"
         headers, params = self.authenticate(headers, params)
-        return self.__make_request(method, endpoint, headers=headers, params=params, data=body, timeout=self.request_timeout)
+        return self.__make_request(
+            method, endpoint,
+            headers=headers,
+            params=params,
+            data=body,
+            timeout=self.request_timeout
+        )
 
     @backoff.on_exception(
         wait_gen=backoff.expo,

@@ -26,3 +26,4 @@ class {{config.tap_name}}InterruptedSyncTest({{config.tap_name}}BaseTest):
                 {% endfor %}
         }
     }
+

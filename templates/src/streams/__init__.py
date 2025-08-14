@@ -7,3 +7,4 @@ STREAMS = {
     "{{ stream.name }}": {{ stream.name|camel_case }},
     {% endfor %}
 }
+

@@ -33,3 +33,4 @@ class {{ stream.name|camel_case }}({% if stream.parent %}ChildBaseStream{% elif 
     {% if stream.children %}
     children = {{ stream.children| tojson }}
     {% endif %}
+
