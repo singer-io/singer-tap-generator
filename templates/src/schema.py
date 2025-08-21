@@ -63,7 +63,7 @@ def get_schemas() -> Tuple[Dict, Dict]:
         mdata = metadata.to_map(mdata)
 
         automatic_keys = getattr(stream_obj, "replication_keys") or []
-        for field_name in schema["properties"].keys():
+        for field_name in schema.get("properties", {}).keys():
             if field_name in automatic_keys:
                 mdata = metadata.write(
                     mdata, ("properties", field_name), "inclusion", "automatic"
@@ -73,3 +73,4 @@ def get_schemas() -> Tuple[Dict, Dict]:
         field_metadata[stream_name] = mdata
 
     return schemas, field_metadata
+

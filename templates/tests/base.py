@@ -16,14 +16,14 @@ class {{config.tap_name}}BaseTest(BaseCase):
 
     Metadata describing streams. A bunch of shared methods that are used
     in tap-tester tests. Shared tap-specific methods (as needed).
-    """    
+    """
     start_date = "2019-01-01T00:00:00Z"
 
     @staticmethod
     def tap_name():
         """The name of the tap."""
         return "tap-{{ config.tap_name|lower }}"
-    
+
     @staticmethod
     def get_type():
         """The name of the tap."""
@@ -75,3 +75,4 @@ class {{config.tap_name}}BaseTest(BaseCase):
 
         return_value["start_date"] = self.start_date
         return return_value
+

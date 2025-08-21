@@ -28,3 +28,4 @@ class {{ stream.name|camel_case }}(FullTableStream):
     {% if stream.children %}
     children = "{{ stream.children }}"
     {% endif %}
+

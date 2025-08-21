@@ -13,3 +13,4 @@ class {{config.tap_name}}PaginationTest(PaginationTest, {{config.tap_name}}BaseT
     def streams_to_test(self):
         streams_to_exclude = {}
         return self.expected_stream_names().difference(streams_to_exclude)
+

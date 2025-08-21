@@ -36,3 +36,4 @@ def discover() -> Catalog:
         )
 
     return catalog
+
