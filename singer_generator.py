@@ -163,7 +163,7 @@ class SingerTapGenerator:
 
         # Generate schemas and stream implementations
         self._generate_schemas_and_streams(tap_dir)
-        
+
         # Generate unit tests
         self._generate_files(UNITTEST_FILES, os.path.join(self.test_dir, "unittests"))
 
