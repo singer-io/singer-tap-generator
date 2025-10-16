@@ -18,6 +18,7 @@ class {{config.tap_name}}BaseTest(BaseCase):
     in tap-tester tests. Shared tap-specific methods (as needed).
     """
     start_date = "2019-01-01T00:00:00Z"
+    PARENT_TAP_STREAM_ID = "parent-tap-stream-id"
 
     @staticmethod
     def tap_name():
@@ -49,6 +50,9 @@ class {{config.tap_name}}BaseTest(BaseCase):
                 {% endfor %}
                 {% endif %}
                 cls.API_LIMIT: {{config.page_size if config.page_size else 100}}
+                {% if stream.get("parent") %}
+                cls.PARENT_TAP_STREAM_ID: {{stream.get("parent")}}
+                {% endif %}
             }{% if not loop.last %},{% endif %}
 
             {% endfor %}
@@ -76,3 +80,11 @@ class {{config.tap_name}}BaseTest(BaseCase):
         return_value["start_date"] = self.start_date
         return return_value
 
+    def expected_parent_tap_stream(self, stream=None):
+        """return a dictionary with key of table name and value of parent stream"""
+        parent_stream = {
+            table: properties.get(self.PARENT_TAP_STREAM_ID, None)
+            for table, properties in self.expected_metadata().items()}
+        if not stream:
+            return parent_stream
+        return parent_stream[stream]
