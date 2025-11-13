@@ -32,7 +32,7 @@ class {{config.tap_name}}ConflictError({{config.tap_name}}Error):
     """class representing 409 status code."""
     pass
 
-class {{config.tap_name}}UnprocessableEntityError({{config.tap_name}}BackoffError):
+class {{config.tap_name}}UnprocessableEntityError({{config.tap_name}}Error):
     """class representing 422 status code."""
     pass
 
