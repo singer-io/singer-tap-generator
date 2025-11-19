@@ -9,7 +9,7 @@ class {{config.tap_name}}DiscoveryTest(DiscoveryTest, {{config.tap_name}}BaseTes
     orphan_streams = {
         {% for stream in config.streams %}
         {% if not stream.get("parent") %}
-        {{ stream.name }},
+        "{{ stream.name }}",
         {% endif %}
         {% endfor %}
     }
