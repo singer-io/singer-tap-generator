@@ -13,7 +13,7 @@ setup(name="tap-{{ config.tap_name|lower }}",
       install_requires=[
         {% for dependency in config.third_party_dependencies %}
         "{{dependency}}",
-        {% endfor %},
+        {% endfor %}
         "parameterized"
       ],
       entry_points="""

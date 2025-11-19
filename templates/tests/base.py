@@ -49,9 +49,9 @@ class {{config.tap_name}}BaseTest(BaseCase):
                 cls.{{ key }}: {{ value }},
                 {% endfor %}
                 {% endif %}
-                cls.API_LIMIT: {{config.page_size if config.page_size else 100}}
+                cls.API_LIMIT: {{config.page_size if config.page_size else 100}},
                 {% if stream.get("parent") %}
-                cls.PARENT_TAP_STREAM_ID: {{stream.get("parent")}}
+                cls.PARENT_TAP_STREAM_ID: "{{stream.get("parent")}}"
                 {% endif %}
             }{% if not loop.last %},{% endif %}
 
