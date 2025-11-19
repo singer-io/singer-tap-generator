@@ -36,10 +36,10 @@ class {{config.tap_name}}BaseTest(BaseCase):
         return {
             {% for stream in config.streams %}
             "{{ stream.name }}": {
-                cls.PRIMARY_KEYS: { {{stream.key_properties|join(", ")|tojson}} },
+                cls.PRIMARY_KEYS: { "{{stream.key_properties|join('", "')}}" },
                 cls.REPLICATION_METHOD: cls.{{ stream.get("replication_method", "FULL_TABLE") }},
                 {% if stream.get("replication_keys") %}
-                cls.REPLICATION_KEYS: { {{stream.replication_keys|join(", ")|tojson}} },
+                cls.REPLICATION_KEYS: { "{{stream.replication_keys|join('", "')}}" },
                 {% else %}
                 cls.REPLICATION_KEYS: set(),
                 {% endif %}
