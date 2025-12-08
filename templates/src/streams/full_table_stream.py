@@ -23,9 +23,9 @@ class {{ stream.name|camel_case }}(FullTableStream):
     path = "{{ stream.path }}"
     {% endif %}
     {% if stream.parent %}
-    path = "{{ stream.parent }}"
+    parent = "{{ stream.parent }}"
     {% endif %}
     {% if stream.children %}
-    children = "{{ stream.children }}"
+    children = {{ stream.children| tojson }}
     {% endif %}
 

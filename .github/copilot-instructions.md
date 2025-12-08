@@ -108,3 +108,77 @@ def is_valid_bookmark_state(state):
 - Use pylint and aim for zero error-level messages.
 - CI pipelines (e.g., CircleCI) should enforce linting.
 - Fix or explicitly disable warnings when appropriate.
+
+
+## 10. Loop Safety
+
+- **Avoid `while True` loops.** Use explicit conditions instead (e.g., `while has_more_pages`).
+- Every loop must have a clear exit condition that will eventually be satisfied.
+- For pagination loops, ensure there's a termination condition (e.g., no next page, empty results, max iterations).
+- Add safeguards like maximum iteration counts or timeouts for loops that depend on external API responses.
+
+Good example (explicit condition):
+```python
+max_pages = 1000
+current_page = 1
+has_more_pages = True
+
+while has_more_pages and current_page <= max_pages:
+    response = fetch_page(current_page)
+    if not response or not response.get('data'):
+        has_more_pages = False
+        break
+
+    process_data(response['data'])
+
+    next_page = response.get('next_page')
+    if not next_page:
+        has_more_pages = False
+    else:
+        current_page += 1
+```
+
+Bad example (using while True):
+```python
+while True:
+    response = fetch_page()
+    if not response:
+        break  # Avoid this pattern
+    process_data(response)
+```
+
+
+## 11. Record Completeness
+
+- **Never skip records during sync unless absolutely necessary.**
+- If a record encounters an error during transformation or validation, log the error with full context but do not silently skip it.
+- Only skip records if:
+  - They fail schema validation and cannot be processed (log as WARNING or ERROR).
+  - They are explicitly filtered by business logic (e.g., replication key filtering).
+- **Never use `continue` to skip records on errors without logging.**
+
+Good example (log and handle errors):
+```python
+for record in get_records():
+    try:
+        transformed = transformer.transform(record, schema, metadata)
+        write_record(stream_name, transformed)
+        counter.increment()
+    except Exception as e:
+        LOGGER.error(f"Failed to transform record {record.get('id')}: {e}")
+        # Re-raise or handle based on severity
+        raise
+```
+
+Bad example (silently skipping records):
+```python
+for record in get_records():
+    try:
+        transformed = transformer.transform(record, schema, metadata)
+        write_record(stream_name, transformed)
+    except Exception:
+        continue  # Silently skips - BAD!
+```
+
+- For incremental streams, ensure bookmark filtering logic is correct to avoid data loss.
+- If a record must be skipped, document why in the code and log it clearly.
