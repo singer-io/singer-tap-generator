@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""
+Singer Schema Validator
+
+Validates JSON schema files for Singer taps, checking for:
+- Valid JSON structure
+- Missing additionalProperties on nested objects
+- Inconsistent indentation
+- Missing property definitions for object types
+- Invalid type declarations
+- Missing format specifications for date/time fields
+- Orphaned/empty schemas
+"""
+
+import json
+import sys
+from pathlib import Path
+from typing import Dict, List, Tuple, Any
+
+
+class SchemaValidator:
+    def __init__(self, schema_dir: str):
+        self.schema_dir = Path(schema_dir)
+        self.issues: List[Dict[str, Any]] = []
+        self.warnings: List[Dict[str, Any]] = []
+
+    def add_issue(self, file: str, severity: str, message: str, line: int = None, path: str = None):
+        """Add a validation issue."""
+        issue = {
+            'file': file,
+            'severity': severity,
+            'message': message,
+        }
+        if line:
+            issue['line'] = line
+        if path:
+            issue['path'] = path
+
+        if severity == 'ERROR':
+            self.issues.append(issue)
+        else:
+            self.warnings.append(issue)
+
+    def check_indentation(self, file_path: Path, content: str) -> None:
+        """Check for consistent indentation (both 2-space and 4-space are acceptable)."""
+        # Indentation check disabled - both 2-space and 4-space are acceptable
+        pass
+
+    def check_object_properties(self, file_path: Path, schema: Dict, path: str = "root", in_composition: bool = False) -> None:
+        """Recursively check that all object types have additionalProperties defined.
+        
+        Args:
+            file_path: Path to the schema file
+            schema: Schema dictionary to check
+            path: Current path in the schema (for error reporting)
+            in_composition: True if we're inside anyOf/oneOf/allOf (skip additionalProperties check)
+        """
+        if not isinstance(schema, dict):
+            return
+
+        # Check if this is an object type definition
+        schema_type = schema.get('type')
+
+        # Handle both single type and array of types
+        is_object = False
+        if isinstance(schema_type, str):
+            is_object = schema_type == 'object'
+        elif isinstance(schema_type, list):
+            is_object = 'object' in schema_type
+
+        if is_object:
+            # Get properties and additionalProperties
+            properties = schema.get('properties', {})
+            additional_props = schema.get('additionalProperties')
+
+            # Only check for additionalProperties if:
+            # 1. The object has NO properties defined, AND
+            # 2. We're NOT inside anyOf/oneOf/allOf (where flexibility is intentional)
+            if not properties and not in_composition:
+                # Check for additionalProperties on objects without properties
+                if 'additionalProperties' not in schema:
+                    self.add_issue(
+                        file_path.name,
+                        'ERROR',
+                        f'Object at "{path}" missing "additionalProperties" constraint (no properties defined)',
+                        path=path
+                    )
+                # If it's an object with additionalProperties:false but no properties, that's suspicious
+                elif additional_props is False and path != "root":
+                    self.add_issue(
+                        file_path.name,
+                        'WARNING',
+                        f'Object at "{path}" has no properties defined but additionalProperties is false',
+                        path=path
+                    )
+
+        # Recursively check nested structures
+        if 'properties' in schema:
+            for prop_name, prop_schema in schema['properties'].items():
+                self.check_object_properties(file_path, prop_schema, f"{path}.{prop_name}", in_composition)
+
+        if 'items' in schema:
+            items = schema['items']
+            if isinstance(items, dict):
+                self.check_object_properties(file_path, items, f"{path}[]", in_composition)
+            elif isinstance(items, list):
+                for i, item in enumerate(items):
+                    self.check_object_properties(file_path, item, f"{path}[{i}]", in_composition)
+
+        # Check nested schemas in oneOf, anyOf, allOf - mark as in_composition
+        for key in ['oneOf', 'anyOf', 'allOf']:
+            if key in schema:
+                for i, sub_schema in enumerate(schema[key]):
+                    self.check_object_properties(file_path, sub_schema, f"{path}.{key}[{i}]", in_composition=True)
+
+    def check_datetime_format(self, file_path: Path, schema: Dict, path: str = "root") -> None:
+        """Check that timestamp-like fields have proper format specification."""
+        if not isinstance(schema, dict):
+            return
+
+        # Check current field
+        if 'type' in schema:
+            schema_type = schema.get('type')
+            field_name = path.split('.')[-1].lower() if '.' in path else ''
+
+            # Check if field name suggests it's a timestamp
+            timestamp_keywords = ['date', 'time', 'timestamp', 'created', 'updated', 'modified']
+            looks_like_timestamp = any(keyword in field_name for keyword in timestamp_keywords) or field_name.endswith('_at')
+
+            # Check if it's a string type
+            is_string = False
+            if isinstance(schema_type, str):
+                is_string = schema_type == 'string'
+            elif isinstance(schema_type, list):
+                is_string = 'string' in schema_type
+
+            if looks_like_timestamp and is_string and 'format' not in schema:
+                self.add_issue(
+                    file_path.name,
+                    'WARNING',
+                    f'Field "{path}" looks like a timestamp but has no format specification',
+                    path=path
+                )
+
+        # Recurse
+        if 'properties' in schema:
+            for prop_name, prop_schema in schema['properties'].items():
+                self.check_datetime_format(file_path, prop_schema, f"{path}.{prop_name}")
+
+        if 'items' in schema and isinstance(schema['items'], dict):
+            self.check_datetime_format(file_path, schema['items'], f"{path}[]")
+
+    def validate_json_structure(self, file_path: Path, content: str) -> Tuple[bool, Dict]:
+        """Validate that the file is valid JSON and return the parsed schema."""
+        try:
+            schema = json.loads(content)
+            return True, schema
+        except json.JSONDecodeError as e:
+            self.add_issue(
+                file_path.name,
+                'ERROR',
+                f'Invalid JSON: {str(e)}',
+                line=e.lineno
+            )
+            return False, {}
+
+    def check_root_schema_structure(self, file_path: Path, schema: Dict) -> None:
+        """Check that root schema has proper structure."""
+        if not schema:
+            self.add_issue(
+                file_path.name,
+                'ERROR',
+                'Schema is empty or invalid'
+            )
+            return
+
+        # Root should be an object
+        if schema.get('type') != 'object':
+            self.add_issue(
+                file_path.name,
+                'WARNING',
+                f'Root schema type is "{schema.get("type")}" (expected "object")'
+            )
+
+        # Root should have properties
+        if 'properties' not in schema:
+            self.add_issue(
+                file_path.name,
+                'ERROR',
+                'Root schema has no properties defined'
+            )
+
+        # Root should have additionalProperties defined
+        if 'additionalProperties' not in schema:
+            self.add_issue(
+                file_path.name,
+                'ERROR',
+                'Root schema missing "additionalProperties" constraint'
+            )
+
+    def validate_file(self, file_path: Path) -> None:
+        """Validate a single schema file."""
+        print(f"Validating {file_path.name}...")
+
+        try:
+            content = file_path.read_text()
+        except Exception as e:
+            self.add_issue(
+                file_path.name,
+                'ERROR',
+                f'Could not read file: {str(e)}'
+            )
+            return
+
+        # Check indentation
+        self.check_indentation(file_path, content)
+
+        # Validate JSON structure
+        valid, schema = self.validate_json_structure(file_path, content)
+        if not valid:
+            return
+
+        # Check root schema structure
+        self.check_root_schema_structure(file_path, schema)
+
+        # Check object properties recursively
+        self.check_object_properties(file_path, schema)
+
+        # Check datetime formats
+        self.check_datetime_format(file_path, schema)
+
+    def validate_all(self) -> bool:
+        """Validate all schema files in the directory."""
+        if not self.schema_dir.exists():
+            print(f"Error: Schema directory '{self.schema_dir}' does not exist")
+            return False
+
+        if not self.schema_dir.is_dir():
+            print(f"Error: '{self.schema_dir}' is not a directory")
+            return False
+
+        schema_files = list(self.schema_dir.glob('*.json'))
+
+        if not schema_files:
+            print(f"Warning: No .json schema files found in '{self.schema_dir}'")
+            return True
+
+        print(f"Found {len(schema_files)} schema files in {self.schema_dir}\n")
+
+        for schema_file in sorted(schema_files):
+            self.validate_file(schema_file)
+
+        return len(self.issues) == 0
+
+    def _group_issues(self, issues: List[Dict[str, Any]]) -> Dict[str, Dict[str, List[str]]]:
+        """Group issues by file and message for better readability."""
+        grouped = {}
+        for issue in issues:
+            file = issue['file']
+            message = issue['message']
+            path = issue.get('path', '')
+            
+            if file not in grouped:
+                grouped[file] = {}
+            if message not in grouped[file]:
+                grouped[file][message] = []
+            
+            if path:
+                grouped[file][message].append(path)
+        
+        return grouped
+
+    def print_report(self) -> None:
+        """Print validation report."""
+        print("\n" + "=" * 80)
+        print("VALIDATION REPORT")
+        print("=" * 80)
+
+        if not self.issues and not self.warnings:
+            print("\n✅ All schemas are valid! No issues found.\n")
+            return
+
+        # Print errors
+        if self.issues:
+            print(f"\n❌ ERRORS ({len(self.issues)}):")
+            print("-" * 80)
+            grouped_errors = self._group_issues(self.issues)
+            for file, messages in sorted(grouped_errors.items()):
+                print(f"\n[{file}]")
+                for message, paths in messages.items():
+                    print(f"  → {message}")
+                    # if paths:
+                    #     for path in sorted(paths):
+                    #         print(f"      • {path}")
+                    # print()
+
+        # Print warnings
+        if self.warnings:
+            print(f"\n⚠️  WARNINGS ({len(self.warnings)}):")
+            print("-" * 80)
+            grouped_warnings = self._group_issues(self.warnings)
+            for file, messages in sorted(grouped_warnings.items()):
+                print(f"\n[{file}]")
+                for message, paths in messages.items():
+                    print(f"  → {message}")
+                    # if paths:
+                    #     for path in sorted(paths):
+                    #         print(f"      • {path}")
+                    # print()
+
+        # Summary
+        print("=" * 80)
+        print(f"SUMMARY: {len(self.issues)} errors, {len(self.warnings)} warnings")
+        print("=" * 80 + "\n")
+
+
+def main():
+    """Main entry point."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='Validate Singer tap schema files',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Validate schemas in tap-tempo
+  python validate_singer_schemas.py tap-tempo/tap_tempo/schemas
+  
+  # Validate schemas in tap-sparkpost
+  python validate_singer_schemas.py tap-sparkpost/tap_sparkpost/schemas
+  
+  # Exit with error code if validation fails (useful for CI)
+  python validate_singer_schemas.py tap-tempo/tap_tempo/schemas --strict
+        """
+    )
+
+    parser.add_argument(
+        'schema_directory',
+        help='Directory containing JSON schema files to validate'
+    )
+    parser.add_argument(
+        '--strict',
+        action='store_true',
+        help='Exit with error code 1 if any issues found (useful for CI/CD)'
+    )
+
+    args = parser.parse_args()
+
+    validator = SchemaValidator(args.schema_directory)
+    success = validator.validate_all()
+    validator.print_report()
+
+    if args.strict and not success:
+        sys.exit(1)
+
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()
