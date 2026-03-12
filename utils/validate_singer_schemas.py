@@ -4,12 +4,18 @@ Singer Schema Validator
 
 Validates JSON schema files for Singer taps, checking for:
 - Valid JSON structure
+- Valid JSON Schema data types (string, number, integer, boolean, object, array, null)
 - Missing additionalProperties on nested objects
 - Inconsistent indentation
 - Missing property definitions for object types
 - Invalid type declarations
 - Missing format specifications for date/time fields
+- Fields without null type (non-nullable fields)
 - Orphaned/empty schemas
+
+Can validate either:
+1. A directory of schema JSON files
+2. A Singer catalog file (validates schemas within each stream)
 """
 
 import json
@@ -19,8 +25,12 @@ from typing import Dict, List, Tuple, Any
 
 
 class SchemaValidator:
-    def __init__(self, schema_dir: str):
-        self.schema_dir = Path(schema_dir)
+    # Valid JSON Schema types
+    VALID_TYPES = {'string', 'number', 'integer', 'boolean', 'object', 'array', 'null'}
+
+    def __init__(self, schema_dir: str = None, catalog_file: str = None):
+        self.schema_dir = Path(schema_dir) if schema_dir else None
+        self.catalog_file = Path(catalog_file) if catalog_file else None
         self.issues: List[Dict[str, Any]] = []
         self.warnings: List[Dict[str, Any]] = []
 
@@ -48,7 +58,7 @@ class SchemaValidator:
 
     def check_object_properties(self, file_path: Path, schema: Dict, path: str = "root", in_composition: bool = False) -> None:
         """Recursively check that all object types have additionalProperties defined.
-        
+
         Args:
             file_path: Path to the schema file
             schema: Schema dictionary to check
@@ -150,6 +160,124 @@ class SchemaValidator:
         if 'items' in schema and isinstance(schema['items'], dict):
             self.check_datetime_format(file_path, schema['items'], f"{path}[]")
 
+    def check_valid_types(self, file_path: Path, schema: Dict, path: str = "root") -> None:
+        """Check that only valid JSON Schema types are used.
+        Valid types are: string, number, integer, boolean, object, array, null
+        """
+        if not isinstance(schema, dict):
+            return
+
+        # Check current field's type
+        if 'type' in schema:
+            schema_type = schema.get('type')
+            # Handle single type
+            if isinstance(schema_type, str):
+                if schema_type not in self.VALID_TYPES:
+                    self.add_issue(
+                        file_path.name,
+                        'ERROR',
+                        f'Invalid type "{schema_type}" at "{path}". Valid types are: {", ".join(sorted(self.VALID_TYPES))}',
+                        path=path
+                    )
+
+            # Handle array of types (e.g., ["string", "null"])
+            elif isinstance(schema_type, list):
+                for t in schema_type:
+                    if not isinstance(t, str):
+                        self.add_issue(
+                            file_path.name,
+                            'ERROR',
+                            f'Type in array must be a string at "{path}". Found: {type(t).__name__}',
+                            path=path
+                        )
+                    elif t not in self.VALID_TYPES:
+                        self.add_issue(
+                            file_path.name,
+                            'ERROR',
+                            f'Invalid type "{t}" in type array at "{path}". Valid types are: {", ".join(sorted(self.VALID_TYPES))}',
+                            path=path
+                        )
+
+                # Check for duplicate types in array
+                if len(schema_type) != len(set(schema_type)):
+                    duplicates = [t for t in schema_type if schema_type.count(t) > 1]
+                    self.add_issue(
+                        file_path.name,
+                        'WARNING',
+                        f'Duplicate types {set(duplicates)} in type array at "{path}"',
+                        path=path
+                    )
+
+            else:
+                self.add_issue(
+                    file_path.name,
+                    'ERROR',
+                    f'Type must be a string or array of strings at "{path}". Found: {type(schema_type).__name__}',
+                    path=path
+                )
+
+        # Recurse into properties
+        if 'properties' in schema:
+            for prop_name, prop_schema in schema['properties'].items():
+                self.check_valid_types(file_path, prop_schema, f"{path}.{prop_name}")
+
+        # Recurse into items
+        if 'items' in schema:
+            items = schema['items']
+            if isinstance(items, dict):
+                self.check_valid_types(file_path, items, f"{path}[]")
+            elif isinstance(items, list):
+                for i, item in enumerate(items):
+                    self.check_valid_types(file_path, item, f"{path}[{i}]")
+
+        # Check nested schemas in oneOf, anyOf, allOf
+        for key in ['oneOf', 'anyOf', 'allOf']:
+            if key in schema:
+                for i, sub_schema in enumerate(schema[key]):
+                    self.check_valid_types(file_path, sub_schema, f"{path}.{key}[{i}]")
+
+    def check_non_nullable_fields(self, file_path: Path, schema: Dict, path: str = "root") -> None:
+        """Check for fields that don't allow null values (should be rare in Singer schemas)."""
+        if not isinstance(schema, dict):
+            return
+
+        # Check if this field has a type definition
+        if 'type' in schema and path != "root":
+            schema_type = schema.get('type')
+
+            # Check if field is non-nullable
+            is_nullable = False
+            if isinstance(schema_type, str):
+                is_nullable = (schema_type == 'null')
+            elif isinstance(schema_type, list):
+                is_nullable = ('null' in schema_type)
+
+            # If not nullable and not a nested object, warn
+            if not is_nullable and schema_type != 'object':
+                # Skip if it's an array type (arrays themselves don't need null, but items might)
+                if schema_type != 'array' and not (isinstance(schema_type, list) and 'array' in schema_type):
+                    self.add_issue(
+                        file_path.name,
+                        'WARNING',
+                        f'Field "{path}" does not allow null values - consider adding "null" to type array for optional fields',
+                        path=path
+                    )
+
+        # Recurse into properties
+        if 'properties' in schema:
+            for prop_name, prop_schema in schema['properties'].items():
+                self.check_non_nullable_fields(file_path, prop_schema, f"{path}.{prop_name}")
+
+        # Recurse into array items
+        if 'items' in schema and isinstance(schema['items'], dict):
+            self.check_non_nullable_fields(file_path, schema['items'], f"{path}[]")
+
+        # Recurse into composition schemas
+        for key in ['oneOf', 'anyOf', 'allOf']:
+            if key in schema:
+                for i, sub_schema in enumerate(schema[key]):
+                    self.check_non_nullable_fields(file_path, sub_schema, f"{path}.{key}[{i}]")
+
     def validate_json_structure(self, file_path: Path, content: str) -> Tuple[bool, Dict]:
         """Validate that the file is valid JSON and return the parsed schema."""
         try:
@@ -229,8 +357,136 @@ class SchemaValidator:
         # Check datetime formats
         self.check_datetime_format(file_path, schema)
 
+        # Check valid data types
+        self.check_valid_types(file_path, schema)
+
+        # Check for non-nullable fields
+        self.check_non_nullable_fields(file_path, schema)
+
+    def validate_catalog_file(self) -> bool:
+        """Validate schemas within a Singer catalog file."""
+        if not self.catalog_file.exists():
+            print(f"Error: Catalog file '{self.catalog_file}' does not exist")
+            return False
+
+        if not self.catalog_file.is_file():
+            print(f"Error: '{self.catalog_file}' is not a file")
+            return False
+
+        print(f"Validating catalog: {self.catalog_file}\n")
+
+        try:
+            content = self.catalog_file.read_text()
+        except Exception as e:
+            self.add_issue(
+                self.catalog_file.name,
+                'ERROR',
+                f'Could not read catalog file: {str(e)}'
+            )
+            return False
+
+        # Parse catalog JSON
+        try:
+            catalog = json.loads(content)
+        except json.JSONDecodeError as e:
+            self.add_issue(
+                self.catalog_file.name,
+                'ERROR',
+                f'Invalid JSON in catalog: {str(e)}',
+                line=e.lineno
+            )
+            return False
+
+        # Validate catalog structure
+        if not isinstance(catalog, dict):
+            self.add_issue(
+                self.catalog_file.name,
+                'ERROR',
+                'Catalog must be a JSON object'
+            )
+            return False
+
+        if 'streams' not in catalog:
+            self.add_issue(
+                self.catalog_file.name,
+                'ERROR',
+                'Catalog missing "streams" array'
+            )
+            return False
+
+        streams = catalog['streams']
+        if not isinstance(streams, list):
+            self.add_issue(
+                self.catalog_file.name,
+                'ERROR',
+                '"streams" must be an array'
+            )
+            return False
+
+        print(f"Found {len(streams)} streams in catalog\n")
+
+        # Validate each stream's schema
+        for i, stream in enumerate(streams):
+            if not isinstance(stream, dict):
+                self.add_issue(
+                    self.catalog_file.name,
+                    'ERROR',
+                    f'Stream {i} is not an object'
+                )
+                continue
+
+            stream_name = stream.get('stream', f'stream_{i}')
+            print(f"Validating stream: {stream_name}...")
+
+            # Check for required stream fields
+            if 'stream' not in stream:
+                self.add_issue(
+                    f"{self.catalog_file.name}[{stream_name}]",
+                    'ERROR',
+                    'Stream missing "stream" field (stream name)'
+                )
+
+            if 'schema' not in stream:
+                self.add_issue(
+                    f"{self.catalog_file.name}[{stream_name}]",
+                    'ERROR',
+                    'Stream missing "schema" field'
+                )
+                continue
+
+            schema = stream['schema']
+            if not isinstance(schema, dict):
+                self.add_issue(
+                    f"{self.catalog_file.name}[{stream_name}]",
+                    'ERROR',
+                    f'Schema for stream "{stream_name}" is not an object'
+                )
+                continue
+
+            # Create a pseudo-Path for error reporting
+            pseudo_path = Path(f"{self.catalog_file.name}[{stream_name}]")
+
+            # Validate the schema
+            self.check_root_schema_structure(pseudo_path, schema)
+            self.check_object_properties(pseudo_path, schema)
+            self.check_datetime_format(pseudo_path, schema)
+            self.check_valid_types(pseudo_path, schema)
+            self.check_non_nullable_fields(pseudo_path, schema)
+
+        return len(self.issues) == 0
+
+
     def validate_all(self) -> bool:
-        """Validate all schema files in the directory."""
+        """Validate all schema files in the directory or catalog file."""
+        # If catalog file is specified, validate it
+        if self.catalog_file:
+            return self.validate_catalog_file()
+
+        # Otherwise, validate schema directory
+        if not self.schema_dir:
+            print("Error: No schema directory or catalog file specified")
+            return False
+
         if not self.schema_dir.exists():
             print(f"Error: Schema directory '{self.schema_dir}' does not exist")
             return False
@@ -259,15 +515,15 @@ class SchemaValidator:
             file = issue['file']
             message = issue['message']
             path = issue.get('path', '')
-            
+
             if file not in grouped:
                 grouped[file] = {}
             if message not in grouped[file]:
                 grouped[file][message] = []
-            
+
             if path:
                 grouped[file][message].append(path)
-        
+
         return grouped
 
     def print_report(self) -> None:
@@ -288,10 +544,10 @@ class SchemaValidator:
             for file, messages in sorted(grouped_errors.items()):
                 print(f"\n[{file}]")
                 for message, paths in messages.items():
-                    print(f"  → {message}")
+                    print(f"→ {message}")
                     # if paths:
                     #     for path in sorted(paths):
-                    #         print(f"      • {path}")
+                    #         print(f"  • {path}")
                     # print()
 
         # Print warnings
@@ -302,10 +558,10 @@ class SchemaValidator:
             for file, messages in sorted(grouped_warnings.items()):
                 print(f"\n[{file}]")
                 for message, paths in messages.items():
-                    print(f"  → {message}")
+                    print(f"→ {message}")
                     # if paths:
                     #     for path in sorted(paths):
-                    #         print(f"      • {path}")
+                    #         print(f"  • {path}")
                     # print()
 
         # Summary
@@ -319,24 +575,29 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Validate Singer tap schema files',
+        description='Validate Singer tap schema files or catalog',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Validate schemas in tap-tempo
+  # Validate schemas in tap-tempo directory
   python validate_singer_schemas.py tap-tempo/tap_tempo/schemas
-  
-  # Validate schemas in tap-sparkpost
-  python validate_singer_schemas.py tap-sparkpost/tap_sparkpost/schemas
-  
+
+  # Validate schemas in a catalog file
+  python validate_singer_schemas.py --catalog /tmp/catalog.json
+
   # Exit with error code if validation fails (useful for CI)
-  python validate_singer_schemas.py tap-tempo/tap_tempo/schemas --strict
+  python validate_singer_schemas.py --catalog /tmp/catalog.json --strict
         """
     )
 
     parser.add_argument(
         'schema_directory',
+        nargs='?',
         help='Directory containing JSON schema files to validate'
+    )
+    parser.add_argument(
+        '--catalog',
+        help='Path to Singer catalog file to validate'
     )
     parser.add_argument(
         '--strict',
@@ -346,7 +607,17 @@ Examples:
 
     args = parser.parse_args()
 
-    validator = SchemaValidator(args.schema_directory)
+    # Validate that either schema_directory or --catalog is provided
+    if not args.schema_directory and not args.catalog:
+        parser.error("Either schema_directory or --catalog must be specified")
+
+    if args.schema_directory and args.catalog:
+        parser.error("Cannot specify both schema_directory and --catalog")
+
+    validator = SchemaValidator(
+        schema_dir=args.schema_directory,
+        catalog_file=args.catalog
+    )
     success = validator.validate_all()
     validator.print_report()
 
