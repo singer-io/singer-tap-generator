@@ -21,10 +21,6 @@ inputs:
     description: "yes = run unit tests after upgrading | no = skip"
     type: promptString
     default: "yes"
-  - id: commitChanges
-    description: "yes = commit setup.py after a successful upgrade | no = leave changes unstaged"
-    type: promptString
-    default: "no"
 ---
 
 # Singer Tap — Package Upgrade Workflow
@@ -180,26 +176,6 @@ If any tests fail:
 
 ---
 
-## Step 7 — Commit the Changes  *(only if `commitChanges` = `yes`)*
-
-If `${input:commitChanges}` is **not** `yes`, skip this step entirely — leave
-`setup.py` modified but unstaged so the user can review and commit manually.
-
-If `${input:commitChanges}` is `yes` **and** at least one package was upgraded
-and tests passed, commit:
-
-```powershell
-git -C TAP_DIR add setup.py
-git -C TAP_DIR commit -m "chore: upgrade pinned packages to latest versions
-
-Upgraded packages:
-- package-a: X.Y.Z → A.B.C
-- package-b: X.Y.Z → A.B.C
-"
-```
-
----
-
 ## Final Report
 
 Print a summary:
@@ -237,14 +213,9 @@ Dry run    : yes / no
  Failed         : 0
  Result         : ✅ ALL TESTS PASSED
 
-────────────────────────────────────────────────────────┐
- GIT
-────────────────────────────────────────────────────────┘
- Committed      : yes / no (commitChanges=no — changes left unstaged)
- Commit hash    : <hash> / N/A
-
 ────────────────────────────────────────────────────────
  OVERALL: ✅ UPGRADE COMPLETE — setup.py updated and tests passing
+          Changes left unstaged — use the commit/release prompts to proceed.
 ────────────────────────────────────────────────────────
 ```
 

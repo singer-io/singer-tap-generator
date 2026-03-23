@@ -21,7 +21,7 @@ inputs:
     type: promptString
     default: ""
   - id: startDate
-    description: "Start date for incremental streams in ISO 8601 format e.g. 2024-01-01T00:00:00Z  (only needed when hasTestAccount=yes and no config.json exists)"
+    description: "Start date for incremental streams in ISO 8601 format e.g. 2024-01-01T00:00:00Z"
     type: promptString
     default: "2024-01-01T00:00:00Z"
 ---
@@ -105,21 +105,70 @@ which TAP_NAME || pip show TAP_NAME
 Priority order:
 1. If `${input:configFilePath}` is NOT blank → use that path as `CONFIG_PATH`
 2. Else if `${input:tapDirectory}/config.json` exists → use that as `CONFIG_PATH`
-3. Else if `${input:tapDirectory}/config.json.example` or `${input:tapDirectory}/sample_config.json` exists → note it as a reference but do **not** use it for real runs (fake credentials)
+3. Else if `${input:tapDirectory}/config.json.example` or `${input:tapDirectory}/sample_config.json` exists → note it as reference only (fake credentials — do NOT use for real runs)
 4. Else → `CONFIG_PATH` is unresolved
 
-```bash
-# Check for config files
-ls "${input:tapDirectory}"/*.json 2>/dev/null || echo "NO_JSON_FILES"
+```powershell
+# Check for existing config files
+Get-ChildItem "${input:tapDirectory}" -Filter "*.json" | Select-Object Name
 ```
 
 ### 2b — Validate test account decision
 
 | hasTestAccount | CONFIG_PATH resolved? | Action |
 |---|---|---|
-| `yes` | Yes | Proceed with real credentials → **Step 3A** |
-| `yes` | No | WARN: "No config.json found. Either provide configFilePath or set hasTestAccount=no to use mock mode." → Switch to mock mode → **Step 3B** |
+| `yes` | Yes (from priority 1 or 2) | Proceed with real credentials → **Step 3A** |
+| `yes` | No | Ask user to place `config.json` → **Step 2c** → **Step 3A** |
 | `no` | — | Use mock mode → **Step 3B** |
+
+---
+
+### 2c — Ask user to place `config.json`  *(only when `hasTestAccount=yes` and no config file found)*
+
+**Read `REQUIRED_CONFIG_KEYS` from the tap source** so you can tell the user exactly which keys are needed:
+
+```python
+import ast, pathlib, re
+
+tap_dir = pathlib.Path(r"${input:tapDirectory}")
+init_candidates = list(tap_dir.glob("tap_*/__init__.py"))
+src = init_candidates[0].read_text() if init_candidates else ""
+match = re.search(r"REQUIRED_CONFIG_KEYS\s*=\s*(\[.*?\])", src, re.DOTALL)
+required_keys = ast.literal_eval(match.group(1)) if match else []
+print("Required config keys:", required_keys)
+```
+
+**Display this message and wait for the user to confirm** before continuing:
+
+```
+⏸️  Paused — config.json required
+
+hasTestAccount=yes but no config.json was found at:
+  ${input:tapDirectory}\config.json
+
+Please create that file now with the following keys:
+
+  Required keys : <REQUIRED_CONFIG_KEYS>
+  start_date    : use ISO 8601 format e.g. "2024-01-01T00:00:00Z"
+
+Example:
+  {
+    "<key1>": "<value1>",
+    "<key2>": "<value2>",
+    "start_date": "2024-01-01T00:00:00Z"
+  }
+
+⚠️  Do NOT commit config.json — it contains credentials.
+    Add it to .gitignore if not already present.
+
+Once you have saved the file, type READY to continue.
+(Type SKIP to run in mock mode instead.)
+```
+
+**Wait for the user to reply:**
+- `READY` → verify `${input:tapDirectory}/config.json` now exists and is valid JSON, set `CONFIG_PATH` to that path, ensure `config.json` is in `.gitignore`, then continue to **Step 3A**
+- `SKIP`  → switch to mock mode, continue to **Step 3B**
+- Any other reply → re-show the message above
 
 ---
 

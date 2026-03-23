@@ -117,39 +117,59 @@ git branch --show-current
 
 ### 5a — Resolve paths
 
-Derive the following paths from `${input:tapDirectory}`:
-- `TAPS_DIR`     — the parent folder of the tap directory
-  e.g. `C:\Users\you\workspace\taps\tap-klaviyo` → `C:\Users\you\workspace\taps`
-- `VENVS_DIR`    — `TAPS_DIR\virtual_envs`
-- `TAP_VENV_DIR` — `VENVS_DIR\TAP_NAME`
-  e.g. `C:\Users\you\workspace\taps\virtual_envs\tap-klaviyo`
+Run this PowerShell block to derive all paths **unambiguously** from `${input:tapDirectory}` and `TAP_NAME`.
+`TAP_DIR` is the directory that was confirmed to exist in Step 2 (either cloned or already present).
+
+```powershell
+# TAP_DIR is the full path to the tap (NOT the taps parent folder)
+# e.g. C:\Users\you\workspace\taps\tap-klaviyo
+$TAP_DIR  = "<resolved tap directory from Step 2>"   # already know this — it contains TAP_MODULE
+
+# TAPS_DIR is the PARENT of TAP_DIR — one level up
+$TAPS_DIR = Split-Path $TAP_DIR -Parent              # → C:\Users\you\workspace\taps
+
+# VENVS_DIR is always inside TAPS_DIR (NEVER inside TAP_DIR)
+$VENVS_DIR    = Join-Path $TAPS_DIR "virtual_envs"   # → C:\Users\you\workspace\taps\virtual_envs
+
+# TAP_VENV_DIR is the venv for this specific tap
+$TAP_VENV_DIR = Join-Path $VENVS_DIR $TAP_NAME       # → C:\Users\you\workspace\taps\virtual_envs\tap-klaviyo
+
+Write-Host "TAP_DIR      : $TAP_DIR"
+Write-Host "TAPS_DIR     : $TAPS_DIR"
+Write-Host "VENVS_DIR    : $VENVS_DIR"
+Write-Host "TAP_VENV_DIR : $TAP_VENV_DIR"
+```
+
+> **Critical rule:** `VENVS_DIR` must always be a sibling of the tap directory (inside `TAPS_DIR`),
+> **never** inside `TAP_DIR` itself. If `$TAP_VENV_DIR` starts with `$TAP_DIR`, something is wrong —
+> stop and recompute using `Split-Path` as shown above.
 
 ### 5b — Ensure `virtual_envs` directory exists
 
-```bash
-# Check for the shared virtual_envs directory
-if (-not (Test-Path "VENVS_DIR")) {
-    New-Item -ItemType Directory -Path "VENVS_DIR" | Out-Null
-    Write-Host "Created VENVS_DIR"
+```powershell
+# $VENVS_DIR was computed in 5a — it lives inside TAPS_DIR, NOT inside TAP_DIR
+if (-not (Test-Path $VENVS_DIR)) {
+    New-Item -ItemType Directory -Path $VENVS_DIR | Out-Null
+    Write-Host "Created $VENVS_DIR"
 } else {
-    Write-Host "VENVS_DIR already exists"
+    Write-Host "Already exists: $VENVS_DIR"
 }
 ```
 
 ### 5c — Create the tap's virtual environment (if not already present)
 
-```bash
-if (-not (Test-Path "TAP_VENV_DIR\Scripts\python.exe")) {
-    python -m venv "TAP_VENV_DIR"
-    Write-Host "Created venv at TAP_VENV_DIR"
+```powershell
+if (-not (Test-Path "$TAP_VENV_DIR\Scripts\python.exe")) {
+    python -m venv $TAP_VENV_DIR
+    Write-Host "Created venv at $TAP_VENV_DIR"
 } else {
-    Write-Host "Venv already exists at TAP_VENV_DIR"
+    Write-Host "Venv already exists at $TAP_VENV_DIR"
 }
 ```
 
 Verify the venv was created:
-```bash
-Test-Path "TAP_VENV_DIR\Scripts\python.exe"
+```powershell
+Test-Path "$TAP_VENV_DIR\Scripts\python.exe"   # must return True
 ```
 
 ### 5d — Install the tap into the venv

@@ -23,11 +23,12 @@ This folder contains **VS Code Copilot agent prompt files** (`.prompt.md`) that 
 | [`singer-tap-repo-setup`](#2-singer-tap-repo-setup) | Clone, create venv, install, and branch the tap | `tapNameOrUrl`, `tapDirectory`, `branchName` |
 | [`singer-tap-upgrade-packages`](#3-singer-tap-upgrade-packages) | Upgrade pinned packages in `setup.py` to latest | `tapDirectory`, `skipPackages`, `dryRun` |
 | [`singer-tap-unittests`](#4-singer-tap-unittests) | Generate / update unit tests with maximum coverage | `tapNameOrUrl`, `tapDirectory`, `branchName` |
-| [`singer-tap-schema-audit`](#5-singer-tap-schema-audit) | Deep-audit every JSON schema (Singer conventions) | `tapDirectory`, `streamsToAudit`, `fixIssues` |
-| [`singer-tap-discovery-sync-test`](#6-singer-tap-discovery-sync-test) | End-to-end discovery + sync test (real creds or mock) | `tapNameOrUrl`, `tapDirectory`, `hasTestAccount` |
-| [`singer-tap-new-stream`](#7-singer-tap-new-stream) | Scaffold a brand-new stream (schema + sync + tests) | `tapDirectory`, `streamName`, `apiEndpoint` |
-| [`singer-tap-release-prep`](#8-singer-tap-release-prep) | Bump version, update CHANGELOG, create git tag | `tapDirectory`, `releaseType`, `releaseSummary` |
-| [`singer-tap-commit-changes`](#9-singer-tap-commit-changes) | Stage and commit all workflow changes with a smart message | `tapDirectory`, `commitScope` |
+| [`singer-tap-integration-tests`](#5-singer-tap-integration-tests) | Scaffold the full tap-tester integration suite (live or mock mode) | `tapDirectory`, `branchName`, `testMode` |
+| [`singer-tap-schema-audit`](#6-singer-tap-schema-audit) | Deep-audit every JSON schema (Singer conventions) | `tapDirectory`, `streamsToAudit`, `fixIssues` |
+| [`singer-tap-discovery-sync-test`](#7-singer-tap-discovery-sync-test) | End-to-end discovery + sync test (real creds or mock) | `tapNameOrUrl`, `tapDirectory`, `hasTestAccount` |
+| [`singer-tap-new-stream`](#8-singer-tap-new-stream) | Scaffold a brand-new stream (schema + sync + tests) | `tapDirectory`, `streamName`, `apiEndpoint` |
+| [`singer-tap-release-prep`](#9-singer-tap-release-prep) | Bump version, update CHANGELOG, create git tag | `tapDirectory`, `releaseType`, `releaseSummary` |
+| [`singer-tap-commit-changes`](#10-singer-tap-commit-changes) | Stage and commit all workflow changes with a smart message | `tapDirectory`, `commitScope` |
 
 ---
 
@@ -43,7 +44,7 @@ This folder contains **VS Code Copilot agent prompt files** (`.prompt.md`) that 
 |---|---|---|
 | `tapNameOrUrl` | Tap name or full Git URL e.g. `tap-klaviyo` or `https://github.com/singer-io/tap-klaviyo` | *(required)* |
 | `tapDirectory` | Full local path to the tap folder | *(required)* |
-| `tasks` | Comma-separated tasks to run: `setup`, `upgrade-packages`, `unit-tests`, `schema-audit`, `discovery-sync`, `release`, `commit` — or `all` | `all` |
+| `tasks` | Comma-separated tasks to run: `setup`, `upgrade-packages`, `unit-tests`, `integration-tests`, `schema-audit`, `discovery-sync`, `release`, `commit` — or `all` | `all` |
 | `branchName` | Working branch name | `feature/tap-improvements` |
 | `parentBranch` | Parent branch to base work on (blank = auto-detect) | *(blank)* |
 | `skipPackages` | Packages to skip during upgrade e.g. `singer-python,backoff` | *(blank)* |
@@ -53,12 +54,12 @@ This folder contains **VS Code Copilot agent prompt files** (`.prompt.md`) that 
 | `releaseType` | `patch` \| `minor` \| `major` | `patch` |
 | `releaseSummary` | One-line changelog entry for the release | *(blank)* |
 
-**Example — run unit tests and commit only:**
+**Example — run unit tests, integration tests and commit only:**
 ```
 /singer-tap-dev-workflow
 tapNameOrUrl: tap-monday
 tapDirectory: C:\Users\you\workspace\taps\tap-monday
-tasks: unit-tests,commit
+tasks: unit-tests,integration-tests,commit
 branchName: add-unittests
 ```
 
@@ -112,7 +113,34 @@ Generates or updates unit tests for a Singer tap — covers client methods, stre
 
 ---
 
-### 5. `singer-tap-schema-audit`
+### 5. `singer-tap-integration-tests`
+
+Scaffolds or updates the **full tap-tester integration test suite** for a Singer tap. Reads the tap source to automatically discover streams, primary keys, replication methods, and credential keys, then generates:
+- `tests/base.py` — stream metadata, credentials, and shared helper methods
+- `tests/test_discovery.py` — catalog structure validation
+- `tests/test_all_fields.py` — all fields returned by the API
+- `tests/test_automatic_fields.py` — minimum required fields
+- `tests/test_bookmark.py` — incremental bookmark behaviour
+- `tests/test_start_date.py` — start date filtering
+- `tests/test_pagination.py` — pagination completeness
+- `tests/test_interrupted_sync.py` — resuming after an interrupted sync
+
+When `testMode=mock`, generates the same files using `unittest.mock.patch` on tap internals — no live API account or tap-tester installation required.
+
+**Inputs:**
+
+| Input | Description | Default |
+|---|---|---|
+| `tapDirectory` | Full local path to the tap | *(required)* |
+| `branchStrategy` | `new` \| `existing` | `new` |
+| `branchName` | Branch name for the integration test changes | *(required)* |
+| `testMode` | `live` = real tap-tester account tests \| `mock` = mock-based tests with no live API | `live` |
+
+> **Tip:** Use `testMode=mock` when you do not have a test account or are working in CI without credentials.
+
+---
+
+### 6. `singer-tap-schema-audit`
 
 Audits every JSON schema file in the tap against Singer conventions: nullable fields, `key_properties`, replication keys, `$ref` resolution, and metadata. Produces an annotated report and can auto-fix safe issues.
 
@@ -126,7 +154,7 @@ Audits every JSON schema file in the tap against Singer conventions: nullable fi
 
 ---
 
-### 6. `singer-tap-discovery-sync-test`
+### 7. `singer-tap-discovery-sync-test`
 
 Runs the full Singer pipeline end-to-end:
 1. `--discover` → validates the catalog structure.
@@ -147,7 +175,7 @@ Uses real credentials when `hasTestAccount=yes`, otherwise auto-generates mock d
 
 ---
 
-### 7. `singer-tap-new-stream`
+### 8. `singer-tap-new-stream`
 
 Scaffolds a complete new stream inside an existing tap:
 - Creates the JSON schema file (inferred from a sample API response or generated as a stub).
@@ -169,7 +197,7 @@ Scaffolds a complete new stream inside an existing tap:
 
 ---
 
-### 8. `singer-tap-release-prep`
+### 9. `singer-tap-release-prep`
 
 Bumps the version in `setup.py` / `pyproject.toml`, populates `CHANGELOG.md` with all commits since the last tag, and optionally creates an annotated git tag locally. Does **not** push or publish.
 
@@ -184,7 +212,7 @@ Bumps the version in `setup.py` / `pyproject.toml`, populates `CHANGELOG.md` wit
 
 ---
 
-### 9. `singer-tap-commit-changes`
+### 10. `singer-tap-commit-changes`
 
 Detects all unstaged/staged changes in the tap, groups them by category (packages, unit tests, schemas, changelog, version, other), builds a descriptive commit message automatically, then stages and commits.
 
@@ -205,9 +233,11 @@ Detects all unstaged/staged changes in the tap, groups them by category (package
 {
   "tapNameOrUrl": "tap-ms-teams",
   "tapDirectory": "C:\\Users\\you\\workspace\\taps\\tap-ms-teams",
-  "tasks": "unit-tests,schema-audit,commit",
+  "tasks": "unit-tests,integration-tests,schema-audit,commit",
   "branchName": "gl-master",
   "parentBranch": "master",
+  "branchStrategy": "existing",
+  "testMode": "live",
   "skipPackages": "",
   "dryRunUpgrade": "no",
   "hasTestAccount": "no",
@@ -225,8 +255,11 @@ Pass the file path as `inputFile` when the master workflow asks for it, and all 
 
 | Goal | `tasks` value |
 |---|---|
-| Full pipeline (first time) | `setup,upgrade-packages,unit-tests,schema-audit,commit` |
-| Just fix tests and commit | `unit-tests,commit` |
+| Full pipeline (first time) | `setup,upgrade-packages,unit-tests,integration-tests,schema-audit,commit` |
+| Unit tests + integration tests + commit | `unit-tests,integration-tests,commit` |
+| Just fix unit tests and commit | `unit-tests,commit` |
+| Add integration tests only (mock, no account) | Run `singer-tap-integration-tests` with `testMode=mock` |
+| Add integration tests (live account) | Run `singer-tap-integration-tests` with `testMode=live` |
 | Audit schemas and auto-fix | `schema-audit` (set `fixIssues=yes`) |
 | Add a new stream, then test | Run `singer-tap-new-stream` → then `discovery-sync` |
 | Cut a release | `release,commit` |

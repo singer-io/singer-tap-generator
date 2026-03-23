@@ -14,10 +14,10 @@ inputs:
     type: promptString
   - id: tasks
     description: >
-      Comma-separated list of tasks to run (in order).
-      Options: setup | upgrade-packages | unit-tests | schema-audit | discovery-sync | release | commit
-      Example: setup,upgrade-packages,unit-tests,commit
-      Use 'all' to run the full pipeline (including commit at the end).
+      Comma-separated list of tasks to run after setup (setup always runs automatically).
+      Options: upgrade-packages | unit-tests | integration-tests | schema-audit | discovery-sync | release | commit
+      Example: upgrade-packages,unit-tests,integration-tests,commit
+      Use 'all' to run the full pipeline (upgrade-packages → unit-tests → integration-tests → schema-audit → discovery-sync → release → commit).
     type: promptString
     default: "all"
   - id: skipPackages
@@ -29,11 +29,15 @@ inputs:
     type: promptString
     default: "no"
   - id: branchName
-    description: "Working branch name (used by setup, unit-tests, release steps)"
+    description: "Working branch name — the branch to create (if branchStrategy=new) or checkout (if branchStrategy=existing)"
     type: promptString
     default: "feature/tap-improvements"
+  - id: branchStrategy
+    description: "new = create a new branch from parentBranch | existing = checkout a branch that already exists"
+    type: promptString
+    default: "new"
   - id: parentBranch
-    description: "Parent branch to base work on (blank = auto-detect)"
+    description: "Parent branch to base work on — only used when branchStrategy=new (blank = auto-detect)"
     type: promptString
     default: ""
   - id: hasTestAccount
@@ -70,6 +74,7 @@ You have access to these specialist prompt workflows:
 | `setup` | `singer-tap-repo-setup` | Clone repo, create branch, install tap |
 | `upgrade-packages` | `singer-tap-upgrade-packages` | Upgrade all pinned packages in setup.py to latest |
 | `unit-tests` | `singer-tap-unittests` | Generate / update full unit test suite |
+| `integration-tests` | `singer-tap-integration-tests` | Generate / update tap-tester integration test suite |
 | `schema-audit` | `singer-tap-schema-audit` | Audit all schemas for Singer conventions |
 | `discovery-sync` | `singer-tap-discovery-sync-test` | Run discovery + sync, validate Singer output |
 | `release` | `singer-tap-release-prep` | Bump version, update CHANGELOG, create tag |
@@ -102,6 +107,7 @@ tapNameOrUrl    = cfg.get("tapNameOrUrl",    "")
 tapDirectory    = cfg.get("tapDirectory",    "")
 tasks           = cfg.get("tasks",           "all")
 branchName      = cfg.get("branchName",      "feature/tap-improvements")
+branchStrategy  = cfg.get("branchStrategy",  "new")
 parentBranch    = cfg.get("parentBranch",    "")
 skipPackages    = cfg.get("skipPackages",    "")
 dryRunUpgrade   = cfg.get("dryRunUpgrade",   "no")
@@ -125,6 +131,7 @@ tapNameOrUrl    = "${input:tapNameOrUrl}"
 tapDirectory    = "${input:tapDirectory}"
 tasks           = "${input:tasks}"
 branchName      = "${input:branchName}"
+branchStrategy  = "${input:branchStrategy}"
 parentBranch    = "${input:parentBranch}"
 skipPackages    = "${input:skipPackages}"
 dryRunUpgrade   = "${input:dryRunUpgrade}"
@@ -149,7 +156,8 @@ Display the following with the resolved values:
   Tap directory   : <tapDirectory>
   Tasks           : <tasks>
   Branch name     : <branchName>
-  Parent branch   : <parentBranch>  (blank = auto-detect)
+  Branch strategy : <branchStrategy>  (new = create from parentBranch | existing = checkout)
+  Parent branch   : <parentBranch>  (only for branchStrategy=new; blank = auto-detect)
 
   [upgrade-packages options]
   Skip packages   : <skipPackages>  (blank = upgrade all)
@@ -177,26 +185,32 @@ Once confirmed:
 ```python
 tasks_raw = tasks.strip().lower()
 
-ALL_TASKS = ["setup", "upgrade-packages", "unit-tests", "schema-audit", "discovery-sync", "release", "commit"]
+# setup is ALWAYS the first task — mandatory, regardless of what the user specified
+OPTIONAL_TASKS = ["upgrade-packages", "unit-tests", "integration-tests", "schema-audit", "discovery-sync", "release", "commit"]
 
-if tasks_raw == "all":
-    tasks = ALL_TASKS
+if tasks_raw in ("all", ""):
+    additional_tasks = OPTIONAL_TASKS
 else:
-    tasks = [t.strip() for t in tasks_raw.split(",") if t.strip() in ALL_TASKS]
-    unknown = [t.strip() for t in tasks_raw.split(",") if t.strip() not in ALL_TASKS]
+    # strip 'setup' from user input if they included it — it will always run anyway
+    user_tasks = [t.strip() for t in tasks_raw.split(",") if t.strip() != "setup"]
+    additional_tasks = [t for t in user_tasks if t in OPTIONAL_TASKS]
+    unknown = [t for t in user_tasks if t not in OPTIONAL_TASKS]
     if unknown:
         print(f"WARNING: Unknown tasks ignored: {unknown}")
 
+tasks = ["setup"] + additional_tasks  # setup is always prepended
+
 print("Tasks to execute (in order):")
 for i, t in enumerate(tasks, 1):
-    print(f"  {i}. {t}")
+    marker = " ← MANDATORY" if t == "setup" else ""
+    print(f"  {i}. {t}{marker}")
 ```
 
 Print the confirmed plan, then begin task execution.
 
 ---
 
-## Step 1 — SETUP  *(only if `setup` in tasks)*
+## Step 1 — SETUP  *(MANDATORY — always runs first)*
 
 **Goal:** Ensure the tap is cloned, the working branch exists, and the package is installed.
 
@@ -205,7 +219,7 @@ Execute all steps from `singer-tap-repo-setup` with these parameters:
 - `tapNameOrUrl`  → `${input:tapNameOrUrl}`
 - `tapDirectory`  → `${input:tapDirectory}`
 - `parentBranch`  → `${input:parentBranch}`
-- `branchStrategy`→ `new` if branch doesn't exist remotely, otherwise `existing`
+- `branchStrategy`→ `${input:branchStrategy}`
 - `branchName`    → `${input:branchName}`
 
 **Success gate:** The tap module must be importable before proceeding.
@@ -259,7 +273,26 @@ Record:
 
 ---
 
-## Step 4 — SCHEMA AUDIT  *(only if `schema-audit` in tasks)*
+## Step 4 — INTEGRATION TESTS  *(only if `integration-tests` in tasks)*
+
+**Goal:** Full tap-tester integration test suite scaffolded and passing.
+
+Execute all steps from `singer-tap-integration-tests` with these parameters:
+- `tapDirectory`    → `${input:tapDirectory}`
+- `branchStrategy`  → `existing`
+- `branchName`      → `${input:branchName}`
+- `testMode`        → `live`
+
+**Success gate:** All 7 test files created/updated under `tests/` with no syntax errors.
+
+Record:
+- Streams discovered
+- Files created / updated
+- Credential env vars required
+
+---
+
+## Step 5 — SCHEMA AUDIT  *(only if `schema-audit` in tasks)*
 
 **Goal:** All schema files pass Singer convention checks.
 
@@ -277,7 +310,7 @@ Record:
 
 ---
 
-## Step 5 — DISCOVERY & SYNC TEST  *(only if `discovery-sync` in tasks)*
+## Step 6 — DISCOVERY & SYNC TEST  *(only if `discovery-sync` in tasks)*
 
 **Goal:** Tap's discovery and sync output are valid Singer messages.
 
@@ -299,7 +332,7 @@ Record:
 
 ---
 
-## Step 6 — RELEASE PREP  *(only if `release` in tasks)*
+## Step 7 — RELEASE PREP  *(only if `release` in tasks)*
 
 **Goal:** Version bumped, CHANGELOG updated, git tag created — ready for PR.
 
@@ -318,7 +351,7 @@ Execute all steps from `singer-tap-release-prep` with:
 
 ---
 
-## Step 7 — COMMIT ALL CHANGES  *(only if `commit` in tasks)*
+## Step 8 — COMMIT ALL CHANGES  *(only if `commit` in tasks)*
 
 **Goal:** Stage and commit every file changed by any task that ran, with a single
 descriptive git commit message that summarises each category of change.
@@ -365,22 +398,27 @@ TASK RESULTS
      Tests passing     : <N>
      Coverage          : utils.py=XX%  __init__.py=XX%
 
-  4. SCHEMA AUDIT      : ✅ PASSED / ⏭️ SKIPPED / ⚠️  WARNINGS / ❌ FAILED
+  4. INTEGRATION TESTS : ✅ PASSED / ⏭️ SKIPPED / ❌ FAILED
+     Streams discovered: <N>
+     Files created     : <N>
+     Env vars required : TAP_<NAME>_<KEY>
+
+  5. SCHEMA AUDIT      : ✅ PASSED / ⏭️ SKIPPED / ⚠️  WARNINGS / ❌ FAILED
      Issues found      : <N>
      Issues fixed      : <N>
      Remaining         : <N>
 
-  5. DISCOVERY & SYNC  : ✅ PASSED / ⏭️ SKIPPED / ⚠️  WARNINGS / ❌ FAILED
+  6. DISCOVERY & SYNC  : ✅ PASSED / ⏭️ SKIPPED / ⚠️  WARNINGS / ❌ FAILED
      Mode              : REAL CREDENTIALS / MOCK
      Streams found     : <N>
      Records returned  : <N> (mock) / <N> (real)
      Protocol issues   : <N>
 
-  6. RELEASE PREP      : ✅ PASSED / ⏭️ SKIPPED / ❌ FAILED
+  7. RELEASE PREP      : ✅ PASSED / ⏭️ SKIPPED / ❌ FAILED
      Version           : OLD → NEW
      Tag created       : vNEW_VERSION
 
-  7. COMMIT CHANGES    : ✅ COMMITTED / ⏭️ SKIPPED (not in tasks) / ⚠️  NOTHING TO COMMIT / ❌ FAILED
+  8. COMMIT CHANGES    : ✅ COMMITTED / ⏭️ SKIPPED (not in tasks) / ⚠️  NOTHING TO COMMIT / ❌ FAILED
      Files staged      : setup.py, tests/unittests/test_X.py ...
      Commit hash       : <hash> / N/A
 
@@ -404,25 +442,27 @@ NEXT ACTIONS
 
 ## Workflow Quick Reference
 
-Run just one task at a time:
+> **Setup always runs first automatically** — no need to include it in `tasks`.
+
+Run just one additional task (setup will still run first):
 ```
-tasks=setup                  — Clone, branch, install only
-tasks=upgrade-packages       — Upgrade setup.py deps to latest
-tasks=unit-tests             — Unit tests only (tap must already be installed)
-tasks=schema-audit           — Schema quality check only
-tasks=discovery-sync         — Discovery + sync validation only
-tasks=release                — Release prep only
-tasks=commit                 — Stage and commit all current changes
+tasks=upgrade-packages       — Setup + upgrade setup.py deps to latest
+tasks=unit-tests             — Setup + unit tests
+tasks=integration-tests      — Setup + tap-tester integration test suite
+tasks=schema-audit           — Setup + schema quality check only
+tasks=discovery-sync         — Setup + discovery + sync validation only
+tasks=release                — Setup + release prep only
+tasks=commit                 — Setup + stage and commit all current changes
 ```
 
-Run the full lifecycle for a new tap (with commit at the end):
+Run the full lifecycle (with commit at the end):
 ```
-tasks=setup,upgrade-packages,unit-tests,schema-audit,discovery-sync,commit
+tasks=all   OR   tasks=upgrade-packages,unit-tests,integration-tests,schema-audit,discovery-sync,commit
 ```
 
 Run specific tasks and commit when done:
 ```
-tasks=upgrade-packages,unit-tests,commit
+tasks=upgrade-packages,unit-tests,integration-tests,commit
 ```
 
 Upgrade packages without modifying any files (preview only):
@@ -444,7 +484,7 @@ tasks=commit
 
 ## Important Rules
 
-- **Always run `setup` first** when working on a tap for the first time.
+- **`setup` is mandatory and always runs first** — it is automatically prepended to every task list. You cannot skip it.
 - **Release is always last** — it must gate on all prior tasks passing.
 - If any step fails its success gate, stop and do not run subsequent tasks.
 - All fixes are done autonomously — never ask the user to fix things manually.
