@@ -1,0 +1,21 @@
+{
+  "_comment": "Singer Tap Dev Workflow — Input File Template",
+  "_usage": "Copy this file to your tap directory (or anywhere), fill in the values, then pass the path as 'inputFile' when running /singer-tap-dev-workflow",
+
+  "tapNameOrUrl": "tap-ms-teams",
+  "tapDirectory": "C:\\Users\\user_name\\Documents\\workspace\\taps\\tap-name",
+
+  "tasks": "unit-tests,schema-audit,commit",
+
+  "branchName": "gl-master",
+  "parentBranch": "master",
+
+  "skipPackages": "",
+  "dryRunUpgrade": "no",
+
+  "hasTestAccount": "no",
+  "configFilePath": "",
+
+  "releaseType": "patch",
+  "releaseSummary": ""
+}
