@@ -20,8 +20,51 @@ Can validate either:
 
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Any, Dict, List, Tuple
+
+
+@dataclass(frozen=True)
+class RootLevelMetadataKeywords:
+    """Expected keys in root level metadata of a Singer catalog stream."""
+
+    SELECTED: str = 'selected'
+    REPLICATION_METHOD: str = 'replication-method'
+    REPLICATION_KEY: str = 'replication-key'
+    VIEW_KEY_PROPERTIES: str = 'view-key-properties'
+    INCLUSION: str = 'inclusion'
+    SELECTED_BY_DEFAULT: str = 'selected-by-default'
+    VALID_REPLICATION_KEYS: str = 'valid-replication-keys'
+    FORCED_REPLICATION_METHOD: str = 'forced-replication-method'
+    TABLE_KEY_PROPERTIES: str = 'table-key-properties'
+    PARENT_TAP_STREAM_ID: str = 'parent-tap-stream-id'
+    SCHEMA_NAME: str = 'schema-name'
+    IS_VIEW: str = 'is-view'
+    ROW_COUNT: str = 'row-count'
+    DATABASE_NAME: str = 'database-name'
+    SQL_DATATYPE: str = 'sql-datatype'
+
+    @classmethod
+    def expected_keys(cls) -> frozenset:
+        """Return a frozenset of expected root level metadata keys."""
+        return frozenset({
+            cls.SELECTED,
+            cls.REPLICATION_METHOD,
+            cls.REPLICATION_KEY,
+            cls.VIEW_KEY_PROPERTIES,
+            cls.INCLUSION,
+            cls.SELECTED_BY_DEFAULT,
+            cls.VALID_REPLICATION_KEYS,
+            cls.FORCED_REPLICATION_METHOD,
+            cls.TABLE_KEY_PROPERTIES,
+            cls.PARENT_TAP_STREAM_ID,
+            cls.SCHEMA_NAME,
+            cls.IS_VIEW,
+            cls.ROW_COUNT,
+            cls.DATABASE_NAME,
+            cls.SQL_DATATYPE
+        })
 
 
 class SchemaValidator:
@@ -363,6 +406,59 @@ class SchemaValidator:
         # Check for non-nullable fields
         self.check_non_nullable_fields(file_path, schema)
 
+    def check_root_level_md(self, root_md: Dict, stream_name: str = '') -> None:
+        """Check that root level metadata has expected structure."""
+        context = f'{self.catalog_file.name}[{stream_name}]' if stream_name else self.catalog_file.name
+
+        if not root_md:
+            self.add_issue(
+                context,
+                'ERROR',
+                'Root level metadata is missing or empty'
+            )
+            return
+
+        if not isinstance(root_md, dict):
+            self.add_issue(
+                context,
+                'ERROR',
+                f'Root level metadata should be an object, found {type(root_md).__name__}'
+            )
+            return
+
+        # Check for expected keys in root level metadata
+        expected_keys = {'breadcrumb', 'metadata'}
+        missing_keys = expected_keys - root_md.keys()
+        if missing_keys:
+            self.add_issue(
+                context,
+                'WARNING',
+                f'Root level metadata is missing expected keys: {", ".join(sorted(missing_keys))}'
+            )
+
+        # Analyse the metadata entries for potential issues
+        md: dict = root_md.get('metadata')
+
+        if not isinstance(md, dict):
+            self.add_issue(
+                context,
+                'ERROR',
+                f'Root level metadata "metadata" field should be an object, found {type(md).__name__}'
+            )
+            return
+
+        discoverable_keys = RootLevelMetadataKeywords.expected_keys()
+        for key in md.keys():
+            if key not in discoverable_keys:
+                # Check if the key uses dot-notation (for nested/custom properties)
+                has_dot = "." in key
+                if not has_dot:
+                    self.add_issue(
+                        context,
+                        'ERROR',
+                        f'Root level metadata key "{key}" is not a standard discoverable key and does not uses dot escape notation'
+                    )
+
     def validate_catalog_file(self) -> bool:
         """Validate schemas within a Singer catalog file."""
         if not self.catalog_file.exists():
@@ -473,8 +569,12 @@ class SchemaValidator:
             self.check_valid_types(pseudo_path, schema)
             self.check_non_nullable_fields(pseudo_path, schema)
 
-        return len(self.issues) == 0
+            # Validate the root level metadata
+            metadata = stream.get("metadata", [])
+            root_md = metadata[0] if metadata and isinstance(metadata, list) else None
+            self.check_root_level_md(root_md, stream_name=stream_name)
 
+        return len(self.issues) == 0
 
     def validate_all(self) -> bool:
         """Validate all schema files in the directory or catalog file."""
