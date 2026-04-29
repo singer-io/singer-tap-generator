@@ -259,15 +259,41 @@ def step_discover(tap_exe: str, config_path: Path, catalog_path: Path,
     print(f"\n  Total streams discovered: {len(rows)}")
 
 
-def step_select_all(catalog_path: Path):
+def load_excluded_streams(exclude_file: Path) -> set:
+    """Load stream names to exclude from a text file (one per line)."""
+    if not exclude_file.is_file():
+        return set()
+    excluded = set()
+    for line in exclude_file.read_text().splitlines():
+        name = line.strip()
+        if name and not name.startswith("#"):
+            excluded.add(name)
+    return excluded
+
+
+def step_select_all(catalog_path: Path, excluded_streams: set = None):
     separator("Step 4: Selecting all streams and fields")
 
+    excluded_streams = excluded_streams or set()
     catalog = json.loads(catalog_path.read_text())
+    selected_count = 0
+    skipped = []
     for stream in catalog["streams"]:
+        stream_name = stream.get("stream", stream.get("tap_stream_id", ""))
+        is_excluded = stream_name in excluded_streams
         for md in stream.get("metadata", []):
-            md["metadata"]["selected"] = True
+            md["metadata"]["selected"] = not is_excluded
+        if is_excluded:
+            skipped.append(stream_name)
+        else:
+            selected_count += 1
+
     catalog_path.write_text(json.dumps(catalog, indent=2))
-    print("  All streams and fields selected.")
+    print(f"  Streams selected : {selected_count}")
+    if skipped:
+        print(f"  Streams excluded : {', '.join(sorted(skipped))}")
+    else:
+        print("  All streams selected (no exclusions).")
 
 
 def step_historical_sync(tap_exe: str, config_path: Path, catalog_path: Path,
@@ -417,6 +443,7 @@ def main():
     discover_log = log_dir / "discovery.log"
     sync_log = log_dir / "sync.log"
     bookmark_sync_log = log_dir / "bookmark_sync.log"
+    exclude_file = tap_dir / "streams_to_exclude.txt"
 
     separator(f"Running: {tap_name}")
 
@@ -436,8 +463,9 @@ def main():
         separator("Done (discovery only)")
         return
 
-    # Step 4: Select all
-    step_select_all(catalog_path)
+    # Step 4: Select all (respecting streams_to_exclude.txt)
+    excluded_streams = load_excluded_streams(exclude_file)
+    step_select_all(catalog_path, excluded_streams)
 
     # Step 5: Historical sync
     step_historical_sync(tap_exe, config_path, catalog_path,
