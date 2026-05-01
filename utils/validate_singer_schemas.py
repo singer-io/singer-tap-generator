@@ -462,11 +462,11 @@ class SchemaValidator:
     def validate_catalog_file(self) -> bool:
         """Validate schemas within a Singer catalog file."""
         if not self.catalog_file.exists():
-            print(f"Error: Catalog file '{self.catalog_file}' does not exist")
+            self.add_issue(str(self.catalog_file), 'ERROR', 'Catalog file does not exist')
             return False
 
         if not self.catalog_file.is_file():
-            print(f"Error: '{self.catalog_file}' is not a file")
+            self.add_issue(str(self.catalog_file), 'ERROR', f"'{self.catalog_file}' is not a file")
             return False
 
         print(f"Validating catalog: {self.catalog_file}\n")
@@ -571,7 +571,10 @@ class SchemaValidator:
 
             # Validate the root level metadata
             metadata = stream.get("metadata", [])
-            root_md = metadata[0] if metadata and isinstance(metadata, list) else None
+            root_md = next(
+                (entry for entry in metadata if isinstance(entry, dict) and entry.get("breadcrumb") == []),
+                None
+            )
             self.check_root_level_md(root_md, stream_name=stream_name)
 
         return len(self.issues) == 0
