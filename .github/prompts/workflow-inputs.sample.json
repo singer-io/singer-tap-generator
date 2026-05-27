@@ -1,0 +1,35 @@
+{
+  "_comment": "Singer Tap Dev Workflow — Input File Template",
+  "_usage": "Copy this file to your tap directory (or anywhere), fill in the values, then pass the path as 'inputFile' when running /singer-tap-dev-workflow",
+
+  "tapNameOrUrl": "tap-drip",
+  "tapDirectory": "C:\\Users\\atul.tiwari2\\Documents\\workspace\\taps\\tap-drip",
+
+  "tasks": "upgrade-packages,unit-tests,integration-tests,schema-audit,discovery-sync",
+  "_tasks_note": "setup is ALWAYS run automatically — no need to include it here",
+
+  "branchStrategy": "existing",
+  "_branchStrategy_note": "new = create a new branch from parentBranch | existing = checkout a branch that already exists",
+  "branchName": "feature/tap-drip-version-upgrade",
+  "_branchName_note": "The branch to create (if branchStrategy=new) or checkout (if branchStrategy=existing)",
+  "parentBranch": "gl-master",
+  "_parentBranch_note": "Only used when branchStrategy=new — the base branch to branch from (blank = auto-detect)",
+
+  "testMode": "live",
+  "_testMode_note": "live = use real tap-tester account tests | mock = generate mock-based tests using unittest.mock.patch — no live API or credentials needed",
+
+  "skipPackages": "",
+  "_skipPackages_note": "Comma-separated package names to leave untouched during upgrade e.g. singer-python,backoff (blank = upgrade all)",
+  "dryRunUpgrade": "yes",
+  "_dryRunUpgrade_note": "yes = preview what would change in setup.py but do NOT modify it | no = apply changes",
+
+  "hasTestAccount": "yes",
+  "_hasTestAccount_note": "yes = run discovery/sync with real API credentials | no = use auto-generated mock data (no credentials needed)",
+  "configFilePath": "",
+  "_configFilePath_note": "Full path to an existing config.json — use this when the file already exists on disk (e.g. C:\\Users\\you\\workspace\\taps\\tap-drip\\config.json). Leave blank and the workflow will pause and ask you to create it when needed.",
+
+  "releaseType": "patch",
+  "_releaseType_note": "patch = bug fixes / minor changes | minor = new features, backward-compatible | major = breaking changes",
+  "releaseSummary": "",
+  "_releaseSummary_note": "One-line human summary used as the heading in CHANGELOG.md e.g. 'Upgrade dependencies and add unit tests'"
+}
