@@ -12,6 +12,7 @@ import os
 from typing import Dict, Any
 from jinja2 import Environment, FileSystemLoader
 from argparse import ArgumentParser
+from response_to_schema_script import convert_to_schema_from_file
 
 # File mapping configurations
 # Maps template files to their output locations in the project structure
@@ -204,14 +205,27 @@ class SingerTapGenerator:
 
     def _generate_schemas_and_streams(self, stream_dir) -> None:
         """Generate JSON schemas and corresponding stream implementations."""
+        responses_dir = os.path.join(os.getcwd(), "responses")
+
         for schema in self.config["streams"]:
             schema_name = schema.get("name")
 
-            # Generate empty schema file (to be filled manually)
+            response_file = os.path.join(responses_dir, f"{schema_name}.json")
             schema_file = os.path.join(stream_dir, "schemas", f"{schema_name}.json")
-            if not os.path.exists(schema_file):
-                with open(schema_file, "w") as f:
-                    json.dump({}, f, indent=4)
+
+            if os.path.exists(response_file):
+                try:
+                    generated_schema = convert_to_schema_from_file(response_file)
+                except Exception as e:
+                    print(f"Error generating schema for '{schema_name}': {e}")
+                    generated_schema = {}
+            else:
+                print(f"Response file not found: {response_file}")
+                generated_schema = {}
+
+            os.makedirs(os.path.dirname(schema_file), exist_ok=True)
+            with open(schema_file, "w") as f:
+                json.dump(generated_schema, f, indent=4)
 
             # Generate stream implementation based on replication method
             stream_file = os.path.join(stream_dir, "streams", f"{schema_name}.py")
