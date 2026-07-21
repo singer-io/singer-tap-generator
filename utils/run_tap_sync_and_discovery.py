@@ -1,29 +1,40 @@
 #!/usr/bin/env python3
 """
-run_tap.py - Universal Discover, Sync, and Test runner for any Singer tap
+run_tap_sync_and_discovery.py - Universal Discover and Sync runner for any Singer tap
 
 Reads credentials from config.json, runs discovery and sync, displays
-results in tabular form (tabulate), saves outputs to JSON files,
-then runs tap-tester integration tests.
+results in tabular form (tabulate), saves outputs to JSON files.
 
 Usage:
-    python run_tap.py <tap-name> [options]
+    python run_tap_sync_and_discovery.py <tap-name> [options]
 
 Examples:
-    python run_tap.py tap-delighted
-    python run_tap.py tap-contentful
-    python run_tap.py tap-delighted --skip-tester
-    python run_tap.py tap-contentful --sync-only
+    python run_tap_sync_and_discovery.py tap-delighted
+    python run_tap_sync_and_discovery.py tap-contentful
+    python run_tap_sync_and_discovery.py tap-contentful --sync-only --catalog /path/to/catalog.json
+    python run_tap_sync_and_discovery.py tap-ebay --tap-dir ~/workspace/taps/tap-ebay
 
 Options:
-    --skip-tester     Skip tap-tester integration tests
-    --discover-only   Run only discovery (no sync or tests)
-    --sync-only       Run discovery + sync (no tests)
+    --discover-only      Run only discovery (no sync)
+    --sync-only          Run sync using an existing catalog (skip discovery)
+    --tap-dir PATH       Full path to the tap directory
+    --config PATH        Path to credentials JSON file
+    --catalog PATH       Path to write/read catalog JSON
+    --state PATH         Path to state file
+    --venv PATH          Path to virtualenv directory
+    --log-dir PATH       Directory for log files
+    --output-dir PATH    Directory for per-stream JSON output
+    --exclude-file PATH  Path to stream exclusion list file
+    --run-id ID          Suffix appended to output filenames for versioning
+
+Runner Config File:
+    Place a runner_config.json in the working directory or tap directory to
+    set persistent defaults. CLI arguments take precedence over the config file.
 """
 
 import argparse
 import json
-import os
+import re
 import shutil
 import subprocess
 import sys
@@ -53,21 +64,30 @@ def mask_value(v: str) -> str:
     v = str(v)
     if len(v) > 12:
         return v[:8] + "..." + v[-4:]
-    return v
+    if len(v) > 4:
+        return v[:2] + "***" + v[-1:]
+    return "****"
 
 
-def run_cmd(cmd: list[str], stdout_path: str = None, stderr_path: str = None,
-            check: bool = True) -> subprocess.CompletedProcess:
+# Default timeout for subprocess calls (seconds). None = no timeout.
+SUBPROCESS_TIMEOUT = 3600  # 1 hour
+
+
+def run_cmd(cmd: list, stdout_path: str = None, stderr_path: str = None,
+            check: bool = True, timeout: int = None) -> subprocess.CompletedProcess:
     """Run a subprocess, optionally redirecting stdout/stderr to files."""
-    stdout_f = open(stdout_path, "w") if stdout_path else None
-    stderr_f = open(stderr_path, "w") if stderr_path else None
+    stdout_f = None
+    stderr_f = None
     try:
+        stdout_f = open(stdout_path, "w") if stdout_path else None
+        stderr_f = open(stderr_path, "w") if stderr_path else None
         result = subprocess.run(
             cmd,
             stdout=stdout_f or subprocess.PIPE,
             stderr=stderr_f or subprocess.PIPE,
             text=True,
             check=check,
+            timeout=timeout or SUBPROCESS_TIMEOUT,
         )
         return result
     finally:
@@ -79,7 +99,8 @@ def run_cmd(cmd: list[str], stdout_path: str = None, stderr_path: str = None,
 
 def find_tap_executable(tap_name: str, tap_venv: Path) -> str:
     """Find the tap executable in the venv."""
-    venv_bin = tap_venv / "bin" / tap_name
+    bin_dir = "Scripts" if sys.platform == "win32" else "bin"
+    venv_bin = tap_venv / bin_dir / tap_name
     if venv_bin.exists():
         return str(venv_bin)
     # Fallback: check if it's on PATH
@@ -89,7 +110,7 @@ def find_tap_executable(tap_name: str, tap_venv: Path) -> str:
     return None
 
 
-def extract_last_state(output_path: str) -> dict | None:
+def extract_last_state(output_path: str):
     """Extract the value from the last STATE message in a Singer output file."""
     last_state = None
     with open(output_path) as f:
@@ -140,7 +161,7 @@ def parse_sync_output(output_path: str):
     return records, schemas, bookmarks
 
 
-def count_records_from_output(output_path: str) -> dict[str, int]:
+def count_records_from_output(output_path: str):
     """Count records per stream from a Singer output file."""
     counts = {}
     with open(output_path) as f:
@@ -184,38 +205,54 @@ def step_validate(tap_dir: Path, config_path: Path):
     print(f"{GREEN}  Config loaded.{NC}")
 
 
+def _ensure_tabulate(tap_venv: Path):
+    """Ensure tabulate is importable, installing into the venv if needed."""
+    global tabulate
+    if tabulate is not None:
+        return
+
+    bin_dir = "Scripts" if sys.platform == "win32" else "bin"
+    pip = tap_venv / bin_dir / "pip"
+    subprocess.run(
+        [str(pip), "install", "tabulate", "-q"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        timeout=120,
+    )
+
+    site_packages = next((tap_venv / "lib").glob("python*/site-packages"), None)
+    if site_packages:
+        sys.path.insert(0, str(site_packages))
+        from tabulate import tabulate as _tabulate
+        tabulate = _tabulate
+    else:
+        print(f"{RED}ERROR: Could not find site-packages in venv to import tabulate.{NC}")
+        sys.exit(1)
+
+
 def step_ensure_venv(tap_name: str, tap_dir: Path, tap_venv: Path) -> str:
     separator(f"Step 2: Activating {tap_name} virtualenv")
 
     if not tap_venv.is_dir():
         print(f"  Creating virtualenv at {tap_venv} ...")
-        subprocess.run([sys.executable, "-m", "venv", str(tap_venv)], check=True)
+        subprocess.run([sys.executable, "-m", "venv", str(tap_venv)],
+                       check=True, timeout=120)
 
     tap_exe = find_tap_executable(tap_name, tap_venv)
     if not tap_exe:
         print(f"  Installing {tap_name} ...")
-        pip = tap_venv / "bin" / "pip"
+        bin_dir = "Scripts" if sys.platform == "win32" else "bin"
+        pip = tap_venv / bin_dir / "pip"
         subprocess.run(
             [str(pip), "install", "-e", str(tap_dir), "-q"],
             check=True,
+            timeout=300,
         )
         tap_exe = find_tap_executable(tap_name, tap_venv)
+        if not tap_exe:
+            print(f"{RED}ERROR: Could not find {tap_name} executable after install.{NC}")
+            sys.exit(1)
 
-    # Ensure tabulate is installed
-    pip = tap_venv / "bin" / "pip"
-    subprocess.run(
-        [str(pip), "install", "tabulate", "-q"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-
-    # Re-import tabulate from the venv if not already available
-    global tabulate
-    if tabulate is None:
-        site_packages = next((tap_venv / "lib").glob("python*/site-packages"), None)
-        if site_packages:
-            sys.path.insert(0, str(site_packages))
-        from tabulate import tabulate as _tabulate
-        tabulate = _tabulate
+    _ensure_tabulate(tap_venv)
 
     print(f"{GREEN}  {tap_name} is available: {tap_exe}{NC}")
     return tap_exe
@@ -235,8 +272,12 @@ def step_discover(tap_exe: str, config_path: Path, catalog_path: Path,
     print()
 
     catalog = json.loads(catalog_path.read_text())
+    streams = catalog.get("streams", [])
+    if not streams:
+        print(f"{RED}ERROR: No streams found in catalog. Discovery may have failed.{NC}")
+        sys.exit(1)
     rows = []
-    for s in catalog["streams"]:
+    for s in streams:
         name = s["stream"]
         keys = ", ".join(s.get("key_properties", [])) or "—"
         root_md = next(
@@ -282,7 +323,8 @@ def step_select_all(catalog_path: Path, excluded_streams: set = None):
         stream_name = stream.get("stream", stream.get("tap_stream_id", ""))
         is_excluded = stream_name in excluded_streams
         for md in stream.get("metadata", []):
-            md["metadata"]["selected"] = not is_excluded
+            if md["breadcrumb"] == []:
+                md["metadata"]["selected"] = not is_excluded
         if is_excluded:
             skipped.append(stream_name)
         else:
@@ -308,13 +350,16 @@ def step_historical_sync(tap_exe: str, config_path: Path, catalog_path: Path,
     )
     print(f"  Sync log : {sync_log}")
 
+    if not sync_output.is_file() or sync_output.stat().st_size == 0:
+        print(f"{RED}WARNING: Sync produced no output. The tap may have exited without emitting records.{NC}")
+
     last_state = extract_last_state(str(sync_output))
     if last_state:
         state_file.write_text(json.dumps(last_state, indent=2))
     print(f"{GREEN}  State saved to {state_file}{NC}")
 
 
-def step_sync_results(sync_output: Path, results_file: Path, tap_dir: Path):
+def step_sync_results(sync_output: Path, results_file: Path, output_dir: Path):
     separator("Step 6: Sync Results")
 
     records, schemas, bookmarks = parse_sync_output(str(sync_output))
@@ -329,7 +374,6 @@ def step_sync_results(sync_output: Path, results_file: Path, tap_dir: Path):
         })
 
     # Save per-stream records
-    output_dir = tap_dir / "output"
     output_dir.mkdir(exist_ok=True)
     for stream, recs in records.items():
         path = output_dir / f"{stream}.json"
@@ -360,6 +404,9 @@ def step_sync_results(sync_output: Path, results_file: Path, tap_dir: Path):
 
 def step_show_state(state_file: Path, label: str):
     separator(label)
+    if not state_file.is_file():
+        print("  No state file found (tap may not emit STATE messages).")
+        return
     state = json.loads(state_file.read_text())
     print(json.dumps(state, indent=2))
 
@@ -368,6 +415,10 @@ def step_bookmark_sync(tap_exe: str, config_path: Path, catalog_path: Path,
                        state_file: Path, bookmark_sync_output: Path,
                        bookmark_sync_log: Path):
     separator("Step 8: Running Bookmark Sync (using state from historical sync)")
+
+    if not state_file.is_file():
+        print("  Skipping bookmark sync — no state file from historical sync.")
+        return
 
     run_cmd(
         [tap_exe, "--config", str(config_path), "--catalog", str(catalog_path),
@@ -414,36 +465,96 @@ def step_summary(tap_name: str, tap_dir: Path):
 # Main
 # ==========================================================================
 
+def _load_runner_config(*search_dirs):
+    """Load runner_config.json from the first directory where it exists."""
+    for d in search_dirs:
+        cfg_file = Path(d) / "runner_config.json"
+        if cfg_file.is_file():
+            return json.loads(cfg_file.read_text())
+    return {}
+
+
+def _resolve_path(cli_value, config_value, default):
+    """Resolve a path: CLI > config file > default. All converted to Path."""
+    if cli_value:
+        return Path(cli_value)
+    if config_value:
+        return Path(config_value)
+    return Path(default)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Universal Discover, Sync, and Test runner for any Singer tap",
     )
     parser.add_argument("tap_name", help="Name of the tap (e.g. tap-delighted)")
-    parser.add_argument("--skip-tester", action="store_true",
-                        help="Skip tap-tester integration tests")
     parser.add_argument("--discover-only", action="store_true",
-                        help="Run only discovery (no sync or tests)")
+                        help="Run only discovery (no sync)")
     parser.add_argument("--sync-only", action="store_true",
-                        help="Run discovery + sync (no tests)")
+                        help="Run sync only using an existing catalog (skip discovery)")
+    parser.add_argument("--tap-dir", type=str, default=None,
+                        help="Full path to the tap directory")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to credentials JSON file")
+    parser.add_argument("--catalog", type=str, default=None,
+                        help="Path to write/read catalog JSON")
+    parser.add_argument("--state", type=str, default=None,
+                        help="Path to state file")
+    parser.add_argument("--venv", type=str, default=None,
+                        help="Path to virtualenv directory")
+    parser.add_argument("--log-dir", type=str, default=None,
+                        help="Directory for log files")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Directory for per-stream JSON output")
+    parser.add_argument("--exclude-file", type=str, default=None,
+                        help="Path to stream exclusion list file")
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="Suffix appended to output filenames for versioning")
     args = parser.parse_args()
 
-    tap_name = args.tap_name
-    taps_root = Path(__file__).resolve().parent
-    tap_dir = taps_root / tap_name
+    if args.discover_only and args.sync_only:
+        parser.error("--discover-only and --sync-only are mutually exclusive")
 
-    # Derive paths
-    config_path = tap_dir / "config.json"
-    catalog_path = tap_dir / "catalog.json"
-    state_file = tap_dir / "state.json"
-    sync_output = tap_dir / "sync_output.json"
-    results_file = tap_dir / "results.json"
-    bookmark_sync_output = tap_dir / "bookmark_sync_output.json"
-    tap_venv = tap_dir / "venv"
-    log_dir = tap_dir / "logs"
-    discover_log = log_dir / "discovery.log"
-    sync_log = log_dir / "sync.log"
-    bookmark_sync_log = log_dir / "bookmark_sync.log"
-    exclude_file = tap_dir / "streams_to_exclude.txt"
+    tap_name = args.tap_name
+
+    # S-01: Validate tap_name to prevent path traversal
+    if not re.match(r'^[a-zA-Z0-9_-]+$', tap_name):
+        print(f"{RED}ERROR: Invalid tap name '{tap_name}'. Only alphanumerics, hyphens, and underscores are allowed.{NC}")
+        sys.exit(1)
+
+    # Determine tap_dir (C-01)
+    taps_root = Path(__file__).resolve().parent
+    default_tap_dir = taps_root / tap_name
+
+    # Load runner config from CWD or tap_dir
+    cfg = _load_runner_config(Path.cwd(), default_tap_dir)
+
+    tap_dir = _resolve_path(args.tap_dir, cfg.get("tap_dir"), default_tap_dir)
+
+    # If tap_dir was overridden, reload config from the new location
+    if tap_dir != default_tap_dir:
+        cfg = _load_runner_config(Path.cwd(), tap_dir)
+
+    # Derive paths with CLI > config > default precedence
+    run_id = args.run_id or cfg.get("run_id", "")
+    suffix = f"_{run_id}" if run_id else ""
+
+    config_path = _resolve_path(args.config, cfg.get("config"), tap_dir / "config.json")
+    catalog_path = _resolve_path(args.catalog, cfg.get("catalog"), tap_dir / "catalog.json")
+    state_file = _resolve_path(args.state, cfg.get("state"), tap_dir / "state.json")
+    tap_venv = _resolve_path(args.venv, cfg.get("venv"), tap_dir / "venv")
+    log_dir = _resolve_path(args.log_dir, cfg.get("log_dir"), tap_dir / "logs")
+    output_dir = _resolve_path(args.output_dir, cfg.get("output_dir"), tap_dir / "output")
+    exclude_file = _resolve_path(args.exclude_file, cfg.get("exclude_file"),
+                                 tap_dir / "streams_to_exclude.txt")
+
+    # Output files (with optional run_id suffix for C-10)
+    sync_output = tap_dir / f"sync_output{suffix}.json"
+    results_file = tap_dir / f"results{suffix}.json"
+    bookmark_sync_output = tap_dir / f"bookmark_sync{suffix}_output.json"
+    discover_log = log_dir / f"discovery{suffix}.log"
+    sync_log = log_dir / f"sync{suffix}.log"
+    bookmark_sync_log = log_dir / f"bookmark_sync{suffix}.log"
 
     separator(f"Running: {tap_name}")
 
@@ -456,23 +567,35 @@ def main():
     # Create log directory
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 3: Discovery
-    step_discover(tap_exe, config_path, catalog_path, discover_log)
+    # --sync-only: skip discovery and selection, use existing catalog
+    if args.sync_only:
+        if not catalog_path.is_file():
+            print(f"{RED}ERROR: Catalog file not found: {catalog_path}{NC}")
+            print("  Use --catalog to provide an existing catalog, or run without --sync-only.")
+            sys.exit(1)
+        # Validate catalog has streams
+        catalog = json.loads(catalog_path.read_text())
+        if not catalog.get("streams"):
+            print(f"{RED}ERROR: Catalog file has no streams: {catalog_path}{NC}")
+            sys.exit(1)
+    else:
+        # Step 3: Discovery
+        step_discover(tap_exe, config_path, catalog_path, discover_log)
 
-    if args.discover_only:
-        separator("Done (discovery only)")
-        return
+        if args.discover_only:
+            separator("Done (discovery only)")
+            return
 
-    # Step 4: Select all (respecting streams_to_exclude.txt)
-    excluded_streams = load_excluded_streams(exclude_file)
-    step_select_all(catalog_path, excluded_streams)
+        # Step 4: Select all (respecting streams_to_exclude.txt)
+        excluded_streams = load_excluded_streams(exclude_file)
+        step_select_all(catalog_path, excluded_streams)
 
     # Step 5: Historical sync
     step_historical_sync(tap_exe, config_path, catalog_path,
                          sync_output, sync_log, state_file)
 
     # Step 6: Sync results
-    step_sync_results(sync_output, results_file, tap_dir)
+    step_sync_results(sync_output, results_file, output_dir)
 
     # Step 7: Show state (historical)
     step_show_state(state_file, "Step 7: Bookmark State (Historical Sync)")
@@ -483,10 +606,6 @@ def main():
 
     # Step 9: Show state (after bookmark sync)
     step_show_state(state_file, "Step 9: Bookmark State (After Bookmark Sync)")
-
-    if args.sync_only:
-        separator("Done (sync only)")
-        return
 
     # Summary
     step_summary(tap_name, tap_dir)
