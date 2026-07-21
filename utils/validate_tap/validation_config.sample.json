@@ -1,0 +1,34 @@
+{
+  "_comment": "Singer Tap Validator - config file (pass via --config <file>)",
+
+  "tap_dir":    "tap_directory_path",
+
+  "_tap_config_comment": "Path to tap_credentials.json — enables LIVE discovery + sync execution. Omit for static-only analysis.",
+  "tap_config": "tap_dir/tap_config.json",
+
+  "_venv_comment": "Optional: path to the virtualenv that has the tap installed. Auto-detected if omitted.",
+  "venv":       "",
+
+  "_output_dir_comment": "Where runtime artifacts are written (catalog.json, sync output, state). Defaults to <tap_dir>/validator_output/",
+  "output_dir": "",
+
+  "_timeout_comment": "Max seconds for a single tap subprocess (discovery or sync). Default 600.",
+  "timeout":    600,
+
+  "checks": [
+    "python_upgrade",
+    "metadata",
+    "unauth_exclusion",
+    "unit_tests",
+    "integration_tests",
+    "discovery",
+    "sync",
+    "schema",
+    "catalog_validation"
+  ],
+
+  "output":     "validation_report.json",
+  "html":       "validation_report.html",
+  "verbose":    false,
+  "fail_fast":  false
+}
