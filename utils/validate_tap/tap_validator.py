@@ -116,6 +116,138 @@ def _fetch_pypi_latest(package: str) -> Optional[str]:
     return version
 
 
+# ---------------------------------------------------------------------------
+# Schema / metadata validation helpers
+# ---------------------------------------------------------------------------
+
+# JSON Schema keys whose *value* must be a non-empty sub-schema object
+_SCHEMA_SUBSCHEMA_KEYS: frozenset = frozenset({
+    "items", "additionalProperties", "contains",
+    "not", "if", "then", "else",
+    "propertyNames", "unevaluatedItems", "unevaluatedProperties",
+})
+
+# Singer / catalog standard root-breadcrumb metadata keys that are always allowed
+_STANDARD_ROOT_METADATA_KEYS: frozenset = frozenset({
+    "table-key-properties",
+    "forced-replication-method",
+    "replication-method",
+    "valid-replication-keys",
+    "inclusion",
+    "parent-tap-stream-id",
+    "selected",
+    "selected-by-default",
+    "row-count",
+    "database-name",
+    "schema-name",
+    "table-name",
+    "view",
+    "is-view",
+})
+
+
+def _check_schema_props_recursive(
+    props: dict,
+    stream_name: str,
+    path_prefix: str = "",
+) -> Tuple[List[str], List[str]]:
+    """
+    Recursively walk JSON Schema *properties* and check:
+      empty sub-schema definitions  (e.g. "items": {})
+      null-only type declarations   (e.g. "type": ["null"])
+
+    Returns (issues, warnings).
+    Only validates JSON Schema objects; Singer metadata structures are
+    never passed into this function.
+    """
+    issues:   List[str] = []
+    warnings: List[str] = []
+
+    for prop_name, prop_def in props.items():
+        if not isinstance(prop_def, dict):
+            continue
+        full_path = f"{path_prefix}.{prop_name}" if path_prefix else prop_name
+
+        # ------------------------------------------------------------------
+        # null-only type
+        # ------------------------------------------------------------------
+        ptype = prop_def.get("type")
+        if ptype is not None:
+            types_list: List[str] = [ptype] if isinstance(ptype, str) else list(ptype)
+            non_null = [t for t in types_list if t != "null"]
+            if not non_null:
+                issues.append(
+                    f"Property '{full_path}': "
+                    f"invalid type {types_list!r}."
+                )
+
+        # ------------------------------------------------------------------
+        # empty sub-schema definitions
+        # ------------------------------------------------------------------
+        for key in _SCHEMA_SUBSCHEMA_KEYS:
+            if key not in prop_def:
+                continue
+            val = prop_def[key]
+            if isinstance(val, dict) and not val:
+                issues.append(
+                    f"[{stream_name}] Property '{full_path}': "
+                    f"schema path '{key}' contains an empty JSON Schema "
+                    f"definition {{}} which is not allowed. "
+                    f"Every schema definition must explicitly declare its "
+                    f"structure (e.g. add 'type', 'properties', '$ref', etc.)."
+                )
+            elif isinstance(val, dict) and "properties" in val:
+                # Recurse into typed sub-schema that itself has properties
+                sub_i, sub_w = _check_schema_props_recursive(
+                    val["properties"], stream_name, f"{full_path}.{key}"
+                )
+                issues.extend(sub_i)
+                warnings.extend(sub_w)
+
+        # Recurse into items.properties when items is a non-empty object
+        items_val = prop_def.get("items")
+        if isinstance(items_val, dict) and items_val and "properties" in items_val:
+            sub_i, sub_w = _check_schema_props_recursive(
+                items_val["properties"], stream_name, f"{full_path}.items"
+            )
+            issues.extend(sub_i)
+            warnings.extend(sub_w)
+
+        # Recurse into nested object properties
+        nested_props = prop_def.get("properties")
+        if isinstance(nested_props, dict):
+            sub_i, sub_w = _check_schema_props_recursive(
+                nested_props, stream_name, full_path
+            )
+            issues.extend(sub_i)
+            warnings.extend(sub_w)
+
+    return issues, warnings
+
+def _check_metadata_key_namespace(
+    root_md: dict, tap_name: str, stream_name: str
+) -> List[str]:
+    """
+    Scenario 4: Custom metadata keys in root breadcrumb must be namespaced
+    with the tap name (e.g. 'tap-dynamics-bc.entity-set-name').
+    Standard Singer keys are always allowed.
+    Returns a list of issue strings.
+    """
+    issues: List[str] = []
+    for key in root_md:
+        if key in _STANDARD_ROOT_METADATA_KEYS:
+            continue
+        # Accept any properly tap-namespaced key: tap-<something>.<rest>
+        if re.match(r'^tap-[\w][\w-]*\.', key):
+            continue
+        issues.append(
+            f"Custom metadata key '{key}' is not namespaced. "
+            f"Custom root metadata keys must be prefixed with the tap name "
+            f"(e.g. '{tap_name}.{key}'). "
+        )
+    return issues
+
+
 # Central venvs dir — same convention as run_tap_discovery_sync.py
 # workspace/taps/virtual_envs/<tap-name>/
 _SCRIPT_DIR        = Path(__file__).resolve().parent          # validate_tap/
@@ -1356,6 +1488,27 @@ def check_schema(tap_dir: Path) -> CheckResult:
 
     schemas_dir = pkg_dir / "schemas"
     if not schemas_dir.is_dir():
+        # Check for dynamic schema generation patterns in discover.py / __init__.py
+        _discover_text = _read_file(pkg_dir / "discover.py") or _read_file(pkg_dir / "__init__.py") or ""
+        _dynamic_patterns = (
+            "schema_from_dict" in _discover_text
+            or "get_schema" in _discover_text
+            or bool(re.search(r"def\s+get_schema|build_schema|generate_schema|load_schema|infer_schema", _discover_text))
+            or bool(re.search(r"from\s+\S+\s+import\s+.*schema", _discover_text, re.IGNORECASE))
+        )
+        # Also treat as dynamic if there are no schema files but discover.py exists
+        _has_discover = (pkg_dir / "discover.py").exists()
+        if _dynamic_patterns or _has_discover:
+            return CheckResult(
+                "schema", "SKIP",
+                "No static schemas/ directory — tap uses dynamic schema generation at discovery time. "
+                "Run with --tap-config and real credentials to validate schemas via catalog_validation check.",
+                [
+                    "  schemas/: NOT FOUND (dynamic schema tap — no static .json schema files)",
+                    "  Schema validation is performed at runtime via tap --discover.",
+                    "  Use catalog_validation check after running discovery to validate schema structure.",
+                ],
+            )
         return CheckResult("schema", "FAIL", "schemas/ directory missing",
                            ["  schemas/: NOT FOUND in tap package"])
 
@@ -1396,6 +1549,11 @@ def check_schema(tap_dir: Path) -> CheckResult:
                 if is_dt and pdef.get("format") != "date-time":
                     dt_missing.append(pname)
 
+        # --- recursive schema property validation --------
+        sch_issues, sch_warns = _check_schema_props_recursive(props, name)
+        fi.extend(sch_issues)
+        fw.extend(sch_warns)
+
         if non_null:
             fw.append(f"{len(non_null)} non-nullable: {', '.join(non_null[:5])}")
         if dt_missing:
@@ -1416,8 +1574,10 @@ def check_schema(tap_dir: Path) -> CheckResult:
             details.append(f"  SCHEMA_FIELD| {name}.json | non-nullable | {', '.join(non_null)}")
         if dt_missing:
             details.append(f"  SCHEMA_FIELD| {name}.json | missing-date-time-format | {', '.join(dt_missing)}")
-        if fi:
-            for issue_line in fi:
+        for issue_line in sch_issues:
+            details.append(f"    error: {issue_line}")
+        if fi and not sch_issues:
+            for issue_line in [x for x in fi if x not in sch_issues]:
                 details.append(f"  SCHEMA_FIELD| {name}.json | error | {issue_line}")
 
     details.append(f"  SCH_INFO| Total: {len(schema_files)} files — {s_issues} error(s), {s_warns} warning(s)")
@@ -1456,10 +1616,11 @@ _VALID_REPLICATION_METHODS = {"INCREMENTAL", "FULL_TABLE", "LOG_BASED"}
 _VALID_INCLUSION_VALUES    = {"automatic", "available", "unsupported"}
 
 
-def _validate_catalog_stream(stream: dict) -> Tuple[List[str], List[str]]:
+def _validate_catalog_stream(stream: dict, tap_name: str = "") -> Tuple[List[str], List[str]]:
     """
     Validate a single catalog stream entry.
     Returns (issues, warnings) — issues are FAIL-level, warnings are WARN-level.
+    tap_name: the tap directory name (e.g. 'tap-dynamics-bc'), used for metadata namespace checks.
     """
     issues:   List[str] = []
     warnings: List[str] = []
@@ -1591,7 +1752,22 @@ def _validate_catalog_stream(stream: dict) -> Tuple[List[str], List[str]]:
             )
 
     # ------------------------------------------------------------------
-    # 9. parent-tap-stream-id — return value for cross-stream check
+    # 9. recursive JSON Schema property validation
+    # ------------------------------------------------------------------
+    if schema_props:
+        sch_issues, sch_warns = _check_schema_props_recursive(schema_props, name)
+        issues.extend(sch_issues)
+        warnings.extend(sch_warns)
+
+    # ------------------------------------------------------------------
+    # 10. custom root metadata keys must be tap-namespaced
+    # ------------------------------------------------------------------
+    if tap_name and root_md:
+        ns_issues = _check_metadata_key_namespace(root_md, tap_name, name)
+        issues.extend(ns_issues)
+
+    # ------------------------------------------------------------------
+    # 11. parent-tap-stream-id — return value for cross-stream check
     # ------------------------------------------------------------------
     # (cross-stream referential validation is done in check_catalog_validation)
 
@@ -1653,9 +1829,11 @@ def check_catalog_validation(tap_dir: Path) -> CheckResult:
     total_issues   = 0
     total_warnings = 0
 
+    tap_name = tap_dir.name  # e.g. "tap-dynamics-bc" — used for Scenario 4
+
     for stream in streams:
         s_name = stream.get("tap_stream_id") or stream.get("stream") or "<unknown>"
-        s_issues, s_warnings = _validate_catalog_stream(stream)
+        s_issues, s_warnings = _validate_catalog_stream(stream, tap_name=tap_name)
 
         status = "OK"
         if s_issues:
