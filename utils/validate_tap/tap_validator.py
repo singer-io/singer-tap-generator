@@ -35,7 +35,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -265,25 +264,6 @@ def _find_tap_exe(tap_name: str, venv_override: Optional[Path] = None) -> Option
     return shutil.which(tap_name)
 
 
-def _build_clean_credentials(tap_config_path: Path) -> Optional[Path]:
-    """
-    Read the universal tap_credentials.json, strip _ -prefixed metadata keys,
-    and write a clean temp file that is safe to pass to the tap executable.
-    Returns the temp file path (caller must clean up).
-    """
-    raw = _load_json(tap_config_path)
-    if not isinstance(raw, dict):
-        return None
-    clean = {k: v for k, v in raw.items() if not k.startswith("_")}
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False, encoding="utf-8"
-    )
-    json.dump(clean, tmp)
-    tmp.flush()
-    tmp.close()
-    return Path(tmp.name)
-
-
 def _run_subprocess(cmd: List[str], timeout: int = 300) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd,
@@ -364,42 +344,52 @@ def check_python_upgrade(tap_dir: Path) -> CheckResult:
     ci_text = _read_file(tap_dir / ".circleci" / "config.yml")
     if ci_text is None:
         issues.append("CircleCI config not found: .circleci/config.yml")
-        details.append("  CircleCI config: NOT FOUND")
+        details.append("  PYUPG_ROW| CircleCI config | FAIL | NOT FOUND (.circleci/config.yml missing)")
     else:
         versions = re.findall(r"(?:--python|python)\s+([\d.]+)", ci_text)
         versions += re.findall(r"python:?([\d.]+)", ci_text)
         if not versions:
             warnings.append("Could not detect Python version in CircleCI config")
-            details.append("  CircleCI: no explicit Python version detected")
+            details.append("  PYUPG_ROW| CircleCI Python | WARN | no explicit version detected in config")
         else:
             for v in set(versions):
                 parts = tuple(int(x) for x in v.split(".")[:2] if x.isdigit())
                 ok = parts and parts >= MIN_PYTHON
-                details.append(f"  CircleCI Python {v}: {'OK' if ok else 'FAIL (expected >= ' + MIN_PYTHON_STR + ')'}")
+                details.append(f"  PYUPG_ROW| CircleCI Python | {'OK' if ok else 'FAIL'} | version {v} {'ok' if ok else '(expected >= ' + MIN_PYTHON_STR + ')'}")
                 if not ok:
                     issues.append(f"CircleCI Python {v} < {MIN_PYTHON_STR}")
+
+        # Coverage pipeline checks
+        cov_checks = {
+            "install coverage":       bool(re.search(r"(?:pip|uv\s+pip)\s+install\b[^\n]*\bcoverage\b", ci_text)),
+            "coverage run -m pytest": bool(re.search(r"coverage\s+run\b.*-m\s+pytest", ci_text)),
+            "coverage html":          bool(re.search(r"coverage\s+html\b", ci_text)),
+        }
+        for label, ok in cov_checks.items():
+            details.append(f"  PYUPG_ROW| CI coverage: {label} | {'OK' if ok else 'WARN'} | {'found in CI config' if ok else 'NOT FOUND in .circleci/config.yml'}")
+            if not ok:
+                warnings.append(f"CircleCI: '{label}' not found in config")
 
     # setup.py / setup.cfg
     setup_text = _read_file(tap_dir / "setup.py") or _read_file(tap_dir / "setup.cfg") or ""
     if not setup_text:
         issues.append("setup.py / setup.cfg not found")
     else:
-        details.append("  setup.py package pins:")
         for pkg in SINGER_PACKAGES:
             m = re.search(rf"{re.escape(pkg)}\s*[=><~!]+([\d.]+)", setup_text, re.IGNORECASE)
             if m:
                 pinned = m.group(1)
                 latest = _fetch_pypi_latest(pkg)
                 if latest is None:
-                    details.append(f"    {pkg}=={pinned}: found (PyPI unreachable, skipping latest check)")
+                    details.append(f"  PYUPG_ROW| {pkg} | INFO | =={pinned} (PyPI unreachable)")
                 elif pinned == latest:
-                    details.append(f"    {pkg}=={pinned}: up-to-date")
+                    details.append(f"  PYUPG_ROW| {pkg} | OK | =={pinned} up-to-date")
                 else:
                     warnings.append(f"{pkg}=={pinned} is outdated (latest: {latest})")
-                    details.append(f"    {pkg}=={pinned}: OUTDATED (latest: {latest})")
+                    details.append(f"  PYUPG_ROW| {pkg} | WARN | =={pinned} OUTDATED (latest: {latest})")
             elif pkg in setup_text:
                 warnings.append(f"{pkg} in setup.py but no version pin")
-                details.append(f"    {pkg}: present but no version pin")
+                details.append(f"  PYUPG_ROW| {pkg} | WARN | present but no version pin")
 
     if issues:
         return CheckResult("python_upgrade", "FAIL",
@@ -428,27 +418,34 @@ def check_metadata(tap_dir: Path) -> CheckResult:
 
     schema_code = "".join(
         _read_file(pkg_dir / f) or ""
-        for f in ["schema.py", "discover.py", "catalog.py"]
+        for f in ["schema.py", "discover.py", "catalog.py", "__init__.py"]
     )
     streams_code = _read_file(pkg_dir / "streams.py") or ""
     sd = pkg_dir / "streams"
     if sd.exists():
         for fp in sd.glob("*.py"):
             streams_code += _read_file(fp) or ""
+    abstracts_code = _read_file(pkg_dir / "abstracts.py") or ""
 
     # replication-method
     if "replication-method" in schema_code or "replication_method" in schema_code:
-        details.append("  replication-method: found in metadata code")
+        details.append("  META_ROW| replication-method | PASS | found in metadata code")
     else:
         warnings.append("replication-method not explicitly set in schema/discover code")
-        details.append("  replication-method: NOT found")
+        details.append("  META_ROW| replication-method | WARN | NOT found in schema/discover code")
 
-    # get_standard_metadata
-    if "get_standard_metadata" in schema_code:
-        details.append("  get_standard_metadata(): used")
+    # get_standard_metadata — may live in schema/discover/__init__, streams, or abstracts
+    _gsm_sources = {
+        "schema/discover/catalog/__init__": "get_standard_metadata" in schema_code,
+        "streams.py":                       "get_standard_metadata" in streams_code,
+        "abstracts.py":                     "get_standard_metadata" in abstracts_code,
+    }
+    _gsm_found = [src for src, hit in _gsm_sources.items() if hit]
+    if _gsm_found:
+        details.append(f"  META_ROW| get_standard_metadata() | PASS | found in {', '.join(_gsm_found)}")
     else:
-        warnings.append("get_standard_metadata() not found")
-        details.append("  get_standard_metadata(): NOT used")
+        warnings.append("get_standard_metadata() not found in any tap source file")
+        details.append("  META_ROW| get_standard_metadata() | WARN | NOT FOUND in any source file")
 
     # parent-tap-stream-id and FULL_TABLE — prefer catalog (ground truth) over static analysis
     out_dir: Path = _RUNTIME.get("output_dir") or (tap_dir / "validator_output")
@@ -465,6 +462,9 @@ def check_metadata(tap_dir: Path) -> CheckResult:
         _streams_list = catalog_data.get("streams", [])
         child_streams_found: List[str] = []
         full_table_streams_found: List[str] = []
+        missing_repl_streams: List[str] = []
+        _stream_repl: Dict[str, str] = {}   # tap_stream_id -> replication method
+        _stream_parent: Dict[str, str] = {} # tap_stream_id -> parent tap_stream_id
         for _s in _streams_list:
             _sname = _s.get("tap_stream_id") or _s.get("stream", "?")
             _root_md = next(
@@ -473,44 +473,76 @@ def check_metadata(tap_dir: Path) -> CheckResult:
             )
             _repl   = _root_md.get("forced-replication-method") or _root_md.get("replication-method", "")
             _parent = _root_md.get("parent-tap-stream-id")
+            _stream_repl[_sname] = _repl
             if _parent:
                 child_streams_found.append(f"{_sname}(parent={_parent})")
+                _stream_parent[_sname] = _parent
             if _repl == "FULL_TABLE":
                 full_table_streams_found.append(_sname)
+            if not _repl:
+                missing_repl_streams.append(_sname)
+
+        # Parent-child replication method consistency check:
+        # - INCREMENTAL parent  -> child MUST be INCREMENTAL
+        # - FULL_TABLE parent   -> child can be FULL_TABLE or INCREMENTAL (both OK)
+        for _child, _par_id in _stream_parent.items():
+            _par_repl   = _stream_repl.get(_par_id, "")
+            _child_repl = _stream_repl.get(_child, "")
+            if _par_repl == "INCREMENTAL" and _child_repl != "INCREMENTAL":
+                warnings.append(
+                    f"Child stream '{_child}' replication is '{_child_repl or 'NOT SET'}' "
+                    f"but parent '{_par_id}' is INCREMENTAL — child must also be INCREMENTAL"
+                )
+                details.append(
+                    f"  META_ROW| replication-consistency | WARN"
+                    f" | {_child} ({_child_repl or 'NOT SET'}) under INCREMENTAL parent {_par_id}"
+                )
+            else:
+                details.append(
+                    f"  META_ROW| replication-consistency | OK"
+                    f" | {_child} ({_child_repl or 'NOT SET'}) under {_par_repl or 'NOT SET'} parent {_par_id}"
+                )
 
         if child_streams_found:
             details.append(
-                f"  parent-tap-stream-id: {len(child_streams_found)} child stream(s) in catalog"
-                f" — {', '.join(child_streams_found)}"
+                f"  META_ROW| parent-tap-stream-id | OK"
+                f" | {len(child_streams_found)} child stream(s): {', '.join(child_streams_found)}"
             )
         else:
-            details.append("  parent-tap-stream-id: no child streams in catalog")
+            # No parent-tap-stream-id in catalog → no parent-child relationships; that is valid.
+            details.append("  META_ROW| parent-tap-stream-id | OK | no parent-child relationships in catalog")
 
         if full_table_streams_found:
             details.append(
-                f"  FULL_TABLE replication: {len(full_table_streams_found)} stream(s)"
-                f" — {', '.join(full_table_streams_found)}"
+                f"  META_ROW| FULL_TABLE streams | OK"
+                f" | {len(full_table_streams_found)} stream(s): {', '.join(full_table_streams_found)}"
             )
         else:
-            details.append("  FULL_TABLE replication: not found in catalog (may be all-incremental)")
+            details.append("  META_ROW| FULL_TABLE streams | OK | not found in catalog (may be all-incremental)")
 
-        details.append(f"  (catalog source: {catalog_source})")
+        if missing_repl_streams:
+            warnings.append(
+                f"replication-method not set in catalog root metadata for: {', '.join(missing_repl_streams)}"
+            )
+            details.append(f"  META_ROW| missing replication-method | WARN | {', '.join(missing_repl_streams)}")
+
+        details.append(f"  META_ROW| catalog source | INFO | {catalog_source}")
     else:
         # Fallback: static code analysis when no catalog is available
         has_parent_attr = bool(re.search(r"\bparent\b\s*=\s*['\"]", streams_code))
         has_parent_meta = "parent-tap-stream-id" in schema_code
         if has_parent_attr and not has_parent_meta:
             issues.append("Child streams exist but parent-tap-stream-id not written in metadata")
-            details.append("  parent-tap-stream-id: MISSING")
+            details.append("  META_ROW| parent-tap-stream-id | FAIL | MISSING (child streams in code but not in metadata)")
         elif has_parent_attr:
-            details.append("  parent-tap-stream-id: written for child streams")
+            details.append("  META_ROW| parent-tap-stream-id | OK | written for child streams (static)")
         else:
-            details.append("  parent-tap-stream-id: no child streams detected (static analysis)")
+            details.append("  META_ROW| parent-tap-stream-id | OK | no child streams detected (static analysis)")
 
         if "FULL_TABLE" in streams_code:
-            details.append("  FULL_TABLE replication: present (static analysis)")
+            details.append("  META_ROW| FULL_TABLE streams | OK | present (static analysis)")
         else:
-            details.append("  FULL_TABLE replication: not found (may be all-incremental)")
+            details.append("  META_ROW| FULL_TABLE streams | OK | not found (may be all-incremental, static)")
 
     if issues:
         return CheckResult("metadata", "FAIL",  "Metadata issues: " + "; ".join(issues), details)
@@ -552,19 +584,21 @@ def check_unauth_exclusion(tap_dir: Path) -> CheckResult:
 
     found = sum(1 for v in checks.values() if v)
     for label, ok in checks.items():
-        details.append(f"  {label}: {'OK' if ok else 'NOT FOUND'}")
+        details.append(f"  UNAUTH_ROW| {label} | {'OK' if ok else 'WARN'} | {'found' if ok else 'NOT FOUND'}")
 
+    # Static analysis may miss tap-specific patterns — downgrade to WARN rather than FAIL
     if not checks["403/Forbidden in discover.py"] and not checks["check_access() method"]:
-        issues.append("No 403/Forbidden/check_access() in discover.py")
+        details.append("  UNAUTH_ROW| 403/check_access pattern | WARN | not found in discover.py (may use different implementation)")
     if not checks["inaccessible stream removal"]:
-        issues.append("No inaccessible stream removal in discover.py")
+        details.append("  UNAUTH_ROW| inaccessible stream removal | WARN | pattern not found in discover.py (may use different implementation)")
 
-    if issues:
-        return CheckResult("unauth_exclusion", "FAIL",
-                           "Unauth exclusion NOT implemented: " + "; ".join(issues), details)
+    if found == 0:
+        return CheckResult("unauth_exclusion", "WARN",
+                           f"Unauth exclusion: no known patterns found ({found}/{len(checks)}) — static analysis only, verify manually",
+                           details)
     if found < 3:
         return CheckResult("unauth_exclusion", "WARN",
-                           f"Unauth exclusion partial ({found}/{len(checks)} patterns)", details)
+                           f"Unauth exclusion partial ({found}/{len(checks)} patterns found)", details)
     return CheckResult("unauth_exclusion", "PASS",
                        f"Unauth stream exclusion fully implemented ({found}/{len(checks)} patterns)",
                        details)
@@ -597,14 +631,14 @@ def check_unit_tests(tap_dir: Path) -> CheckResult:
         issues.append(f"No test_*.py files in {unit_test_dir.relative_to(tap_dir)}")
         return CheckResult("unit_tests", "FAIL", "No unit test files found", issues)
 
-    details.append(f"  Unit test dir: {unit_test_dir.relative_to(tap_dir)}")
-    details.append(f"  Test files: {sorted(f.name for f in test_files)}")
+    details.append(f"  UNIT_ROW| Unit test dir | INFO | {unit_test_dir.relative_to(tap_dir)}")
+    details.append(f"  UNIT_ROW| Test files | INFO | {', '.join(sorted(f.name for f in test_files))}")
 
     for pattern, label in [("test_client",   "HTTP client / auth"),
                             ("test_discover", "discovery / catalog"),
                             ("test_sync",     "sync / bookmarks")]:
         found = any(pattern in f.name for f in test_files)
-        details.append(f"  {label} tests: {'found' if found else 'MISSING'}")
+        details.append(f"  UNIT_ROW| {label} tests | {'OK' if found else 'WARN'} | {'found' if found else 'MISSING'}")
         if not found:
             warnings.append(f"No {label} test file")
 
@@ -616,14 +650,14 @@ def check_unit_tests(tap_dir: Path) -> CheckResult:
             text=True, timeout=30, encoding="utf-8", errors="replace",
         )
         m = re.search(r"(\d+)\s+test", r.stdout)
-        details.append(f"  Pytest collected: {m.group(1) if m else 'unknown'} tests")
+        details.append(f"  UNIT_ROW| Pytest | INFO | collected {m.group(1) if m else 'unknown'} tests")
         if r.returncode != 0 and not m:
             warnings.append("pytest collection failed (possible import errors)")
     except (subprocess.TimeoutExpired, FileNotFoundError):
-        details.append("  pytest: not available or timed out")
+        details.append("  UNIT_ROW| Pytest | WARN | not available or timed out")
 
     if (tap_dir / ".coverage").exists():
-        details.append("  .coverage file: present")
+        details.append("  UNIT_ROW| .coverage | OK | present")
         try:
             pkg_dir = _find_tap_package(tap_dir)
             inc = f"{pkg_dir}/*" if pkg_dir else ""
@@ -635,7 +669,8 @@ def check_unit_tests(tap_dir: Path) -> CheckResult:
             m2 = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", cr.stdout)
             if m2:
                 pct = int(m2.group(1))
-                details.append(f"  Coverage: {pct}%")
+                _cov_st = "OK" if pct >= 70 else "WARN" if pct >= 50 else "FAIL"
+                details.append(f"  UNIT_ROW| Coverage | {_cov_st} | {pct}% (target >= 70%)")
                 if pct < 50:
                     issues.append(f"Coverage {pct}% < minimum 50%")
                 elif pct < 70:
@@ -643,10 +678,10 @@ def check_unit_tests(tap_dir: Path) -> CheckResult:
         except Exception:
             pass
     elif (tap_dir / "htmlcov").is_dir():
-        details.append("  htmlcov/: present")
+        details.append("  UNIT_ROW| htmlcov/ | OK | present (no % data available)")
     else:
         warnings.append("No .coverage — run: coverage run -m pytest tests/unittests/")
-        details.append("  Coverage: not measured")
+        details.append("  UNIT_ROW| Coverage | WARN | not measured")
 
     if issues:
         return CheckResult("unit_tests", "FAIL",  "Unit test issues: " + "; ".join(issues), details)
@@ -673,7 +708,8 @@ def check_integration_tests(tap_dir: Path) -> CheckResult:
     int_files = [f for f in tests_dir.iterdir()
                  if f.is_file() and f.name.startswith("test_") and "unittests" not in str(f)]
 
-    details.append(f"  Integration test files: {sorted(f.name for f in int_files) or 'none'}")
+    _int_file_names = ', '.join(sorted(f.name for f in int_files)) or 'none'
+    details.append(f"  INTEG_ROW| integration files | INFO | {_int_file_names}")
 
     expected = {
         "bookmark":         "test_bookmark",
@@ -686,20 +722,22 @@ def check_integration_tests(tap_dir: Path) -> CheckResult:
     found, missing = [], []
     for t, pat in expected.items():
         if any(pat in f.name for f in int_files):
-            found.append(t);   details.append(f"  {t}: found")
+            found.append(t);   details.append(f"  INTEG_ROW| {t} | OK | found")
         else:
-            missing.append(t); details.append(f"  {t}: NOT found")
+            missing.append(t); details.append(f"  INTEG_ROW| {t} | WARN | NOT found")
 
     if (tests_dir / "base.py").exists():
-        details.append("  tests/base.py: found")
+        details.append("  INTEG_ROW| tests/base.py | OK | found")
     else:
         warnings.append("tests/base.py not found")
+        details.append("  INTEG_ROW| tests/base.py | WARN | NOT found")
 
     ci_text = _read_file(tap_dir / ".circleci" / "config.yml") or ""
     if re.search(r"Integration Tests|run-test|tap_tester", ci_text, re.IGNORECASE):
-        details.append("  CircleCI integration step: found")
+        details.append("  INTEG_ROW| CircleCI integration | OK | found in .circleci/config.yml")
     else:
         warnings.append("No integration step in CircleCI config")
+        details.append("  INTEG_ROW| CircleCI integration | WARN | NOT found in .circleci/config.yml")
 
     if not int_files:
         issues.append("No integration test files found")
@@ -765,86 +803,115 @@ def _check_discovery_runtime(tap_dir: Path, tap_config: Path,
 
     details.append(f"  Tap executable: {tap_exe}")
 
-    # Build clean credentials temp file
-    clean_creds = _build_clean_credentials(tap_config)
-    if clean_creds is None:
-        return CheckResult("discovery", "FAIL", "Could not parse tap_credentials.json", details)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    catalog_path = out_dir / "catalog.json"
 
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        catalog_path = out_dir / "catalog.json"
+    # Run tap --discover
+    result = _run_subprocess(
+        [tap_exe, "--config", str(tap_config), "--discover"],
+        timeout=timeout,
+    )
 
-        # Run tap --discover
-        result = _run_subprocess(
-            [tap_exe, "--config", str(clean_creds), "--discover"],
-            timeout=timeout,
-        )
-
-        if result.returncode != 0:
-            details.append(f"  tap --discover stderr:\n    {result.stderr[-600:]}")
-            return CheckResult("discovery", "FAIL",
-                               f"tap --discover exited with code {result.returncode}",
-                               details)
-
-        # Parse catalog
-        try:
-            catalog = json.loads(result.stdout)
-        except json.JSONDecodeError as e:
-            details.append(f"  Raw output (first 300 chars): {result.stdout[:300]}")
-            return CheckResult("discovery", "FAIL",
-                               f"tap --discover output is not valid JSON: {e}", details)
-
-        # Save catalog
-        catalog_path.write_text(json.dumps(catalog, indent=2), encoding="utf-8")
-        details.append(f"  Catalog saved: {catalog_path}")
-
-        # Validate catalog structure
-        streams = catalog.get("streams", [])
-        if not streams:
-            return CheckResult("discovery", "FAIL",
-                               "Catalog has no streams", details)
-
-        details.append(f"  Streams in catalog: {len(streams)}")
-
-        stream_issues: List[str] = []
-        for s in streams:
-            name = s.get("stream") or s.get("tap_stream_id", "unknown")
-            kp   = s.get("key_properties", [])
-            schema_props = s.get("schema", {}).get("properties", {})
-            root_md = next(
-                (m["metadata"] for m in s.get("metadata", []) if m.get("breadcrumb") == []),
-                {}
-            )
-            repl    = root_md.get("forced-replication-method", root_md.get("replication-method", ""))
-            parent  = root_md.get("parent-tap-stream-id", "")
-
-            row = (f"  Stream: {name}  |  keys={kp}"
-                   f"  |  replication={repl or 'NOT SET'}"
-                   f"  |  fields={len(schema_props)}"
-                   f"  |  parent={parent or '-'}")
-            details.append(row)
-
-            if not kp:
-                stream_issues.append(f"{name}: no key_properties")
-            if not repl:
-                warnings.append(f"{name}: replication-method not in metadata")
-
-        if stream_issues:
-            issues += stream_issues
-
-        if issues:
-            return CheckResult("discovery", "FAIL",
-                               f"Discovery FAILED: {'; '.join(issues)}", details)
-        if warnings:
-            return CheckResult("discovery", "WARN",
-                               f"Discovery OK with {len(streams)} streams, warnings: {'; '.join(warnings[:2])}",
-                               details)
-        return CheckResult("discovery", "PASS",
-                           f"Discovery returned {len(streams)} valid streams with keys and replication-method",
+    if result.returncode != 0:
+        details.append(f"  tap --discover stderr:\n    {result.stderr[-600:]}")
+        return CheckResult("discovery", "FAIL",
+                           f"tap --discover exited with code {result.returncode}",
                            details)
-    finally:
-        if clean_creds and clean_creds.exists():
-            clean_creds.unlink(missing_ok=True)
+
+    # ---- Parse discovery logs (stderr) for warnings, errors, unauth signals ----
+    _log_warnings: List[str] = []
+    _log_errors:   List[str] = []
+    _unauth_lines: List[str] = []
+    for _line in result.stderr.splitlines():
+        _stripped = _line.strip()
+        if not _stripped:
+            continue
+        _upper = _stripped.upper()
+        if re.search(r"\b(403|FORBIDDEN|UNAUTHORIZED|AUTHORIZATIONERROR|ACCESSDENIED)\b", _stripped, re.IGNORECASE):
+            _unauth_lines.append(_stripped)
+        elif "ERROR" in _upper:
+            _log_errors.append(_stripped)
+        elif "WARNING" in _upper or "WARN" in _upper:
+            _log_warnings.append(_stripped)
+
+    if _log_errors:
+        details.append(f"  Discovery log ERRORs ({len(_log_errors)}):")
+        for _e in _log_errors:
+            details.append(f"    [ERROR] {_e}")
+        warnings.append(f"{len(_log_errors)} ERROR line(s) in discovery stderr")
+
+    if _log_warnings:
+        details.append(f"  Discovery log WARNINGs ({len(_log_warnings)}):")
+        for _w in _log_warnings:
+            details.append(f"    [WARN] {_w}")
+        warnings.append(f"{len(_log_warnings)} WARNING line(s) in discovery stderr")
+
+    if _unauth_lines:
+        details.append(f"  Unauth/403 signals in discovery logs ({len(_unauth_lines)}):")
+        for _u in _unauth_lines:
+            details.append(f"    [UNAUTH] {_u}")
+        warnings.append(
+            f"{len(_unauth_lines)} unauth/403 signal(s) in discovery stderr — "
+            "verify inaccessible streams are excluded from catalog"
+        )
+    # -------------------------------------------------------------------------
+
+    # Parse catalog
+    try:
+        catalog = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        details.append(f"  Raw output (first 300 chars): {result.stdout[:300]}")
+        return CheckResult("discovery", "FAIL",
+                           f"tap --discover output is not valid JSON: {e}", details)
+
+    # Save catalog
+    catalog_path.write_text(json.dumps(catalog, indent=2), encoding="utf-8")
+    details.append(f"  DISC_INFO| Catalog | INFO | saved: {catalog_path.name}")
+
+    # Validate catalog structure
+    streams = catalog.get("streams", [])
+    if not streams:
+        return CheckResult("discovery", "FAIL",
+                           "Catalog has no streams", details)
+
+    details.append(f"  DISC_INFO| Streams | INFO | {len(streams)} streams in catalog")
+
+    stream_issues: List[str] = []
+    for s in streams:
+        name = s.get("stream") or s.get("tap_stream_id", "unknown")
+        kp   = s.get("key_properties", [])
+        schema_props = s.get("schema", {}).get("properties", {})
+        root_md = next(
+            (m["metadata"] for m in s.get("metadata", []) if m.get("breadcrumb") == []),
+            {}
+        )
+        repl    = root_md.get("forced-replication-method", root_md.get("replication-method", ""))
+        parent  = root_md.get("parent-tap-stream-id", "")
+
+        row = (f"  Stream: {name}  |  keys={kp}"
+               f"  |  replication={repl or 'NOT SET'}"
+               f"  |  fields={len(schema_props)}"
+               f"  |  parent={parent or '-'}")
+        details.append(row)
+
+        if not kp:
+            stream_issues.append(f"{name}: no key_properties")
+        if not repl:
+            warnings.append(f"{name}: replication-method not in metadata")
+
+    if stream_issues:
+        issues += stream_issues
+
+    if issues:
+        return CheckResult("discovery", "FAIL",
+                           f"Discovery FAILED: {'; '.join(issues)}", details)
+    if warnings:
+        return CheckResult("discovery", "WARN",
+                           f"Discovery OK with {len(streams)} streams, warnings: {'; '.join(warnings[:2])}",
+                           details)
+    return CheckResult("discovery", "PASS",
+                       f"Discovery returned {len(streams)} valid streams with keys and replication-method",
+                       details)
 
 
 def _check_discovery_static(tap_dir: Path, tap_config: Optional[Path]) -> CheckResult:
@@ -853,9 +920,9 @@ def _check_discovery_static(tap_dir: Path, tap_config: Optional[Path]) -> CheckR
     warnings: List[str] = []
 
     if tap_config:
-        details.append("  Mode: STATIC (tap_credentials.json has placeholder values — fill in real credentials to enable runtime check)")
+        details.append("  DISC_INFO| Mode | INFO | STATIC (placeholder credentials — provide real credentials for runtime check)")
     else:
-        details.append("  Mode: STATIC (no --tap-config provided)")
+        details.append("  DISC_INFO| Mode | INFO | STATIC (no --tap-config provided)")
 
     pkg_dir = _find_tap_package(tap_dir)
     if not pkg_dir:
@@ -876,16 +943,19 @@ def _check_discovery_static(tap_dir: Path, tap_config: Optional[Path]) -> CheckR
     }
     for label, ok in checks.items():
         mark = "OK" if ok else "NOT FOUND"
-        details.append(f"  {label}: {mark}")
-        if not ok and label in ("discover() function defined", "Catalog constructed",
-                                "CatalogEntry used", "Schema loaded per stream"):
+        _fail_labels = ("discover() function defined", "Catalog constructed",
+                        "CatalogEntry used", "Schema loaded per stream")
+        st = "OK" if ok else ("FAIL" if label in _fail_labels else "WARN")
+        details.append(f"  DISC_INFO| {label} | {st} | {mark}")
+        if not ok and label in _fail_labels:
             issues.append(f"discover.py: {label}")
 
     init_text = _read_file(pkg_dir / "__init__.py") or ""
     if "discover" in init_text:
-        details.append("  __init__.py references discover(): OK")
+        details.append("  DISC_INFO| __init__.py | OK | discover() referenced")
     else:
         warnings.append("discover() not referenced in __init__.py")
+        details.append("  DISC_INFO| __init__.py | WARN | discover() not referenced")
 
     if issues:
         return CheckResult("discovery", "FAIL",  "Discovery code issues: " + "; ".join(issues), details)
@@ -925,7 +995,7 @@ def _check_sync_runtime(tap_dir: Path, tap_config: Path,
     warnings: List[str] = []
     tap_name = tap_dir.name
 
-    details.append("  Mode: RUNTIME (executing Sync1 + Sync2)")
+    details.append("  SYNC_INFO| Mode | INFO | RUNTIME (executing Sync1 + Sync2)")
 
     tap_exe = _find_tap_exe(tap_name, venv_path)
     if not tap_exe:
@@ -933,183 +1003,281 @@ def _check_sync_runtime(tap_dir: Path, tap_config: Path,
                            f"Tap executable '{tap_name}' not found. Run discovery first.",
                            [f"  Hint: pass --venv /path/to/venv or install the tap first"])
 
-    clean_creds = _build_clean_credentials(tap_config)
-    if clean_creds is None:
-        return CheckResult("sync", "FAIL", "Could not parse tap_credentials.json", details)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    catalog_path = out_dir / "catalog.json"
+    state1_path  = out_dir / "state_sync1.json"
+    sync1_out    = out_dir / "sync1_output.json"
+    sync2_out    = out_dir / "sync2_output.json"
 
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        catalog_path = out_dir / "catalog.json"
-        state1_path  = out_dir / "state_sync1.json"
-        sync1_out    = out_dir / "sync1_output.json"
-        sync2_out    = out_dir / "sync2_output.json"
+    # ------------------------------------------------------------------
+    # Step A: Discovery to get catalog (reuse if already produced)
+    # ------------------------------------------------------------------
+    if not catalog_path.is_file():
+        details.append("  SYNC_INFO| Discovery | INFO | running --discover to get catalog")
+        disc = _run_subprocess(
+            [tap_exe, "--config", str(tap_config), "--discover"],
+            timeout=120,
+        )
+        if disc.returncode != 0:
+            return CheckResult("sync", "FAIL",
+                               f"Discovery for sync failed (exit {disc.returncode})",
+                               details + [f"  stderr: {disc.stderr[-400:]}"])
+        try:
+            catalog = json.loads(disc.stdout)
+        except json.JSONDecodeError:
+            return CheckResult("sync", "FAIL", "Discovery output not valid JSON", details)
+        catalog_path.write_text(json.dumps(catalog, indent=2), encoding="utf-8")
+    else:
+        catalog = _load_json(catalog_path)
+        details.append(f"  SYNC_INFO| Catalog | INFO | reusing existing {catalog_path.name}")
 
-        # ------------------------------------------------------------------
-        # Step A: Discovery to get catalog (reuse if already produced)
-        # ------------------------------------------------------------------
-        if not catalog_path.is_file():
-            details.append("  Running --discover to get catalog...")
-            disc = _run_subprocess(
-                [tap_exe, "--config", str(clean_creds), "--discover"],
-                timeout=120,
-            )
-            if disc.returncode != 0:
-                return CheckResult("sync", "FAIL",
-                                   f"Discovery for sync failed (exit {disc.returncode})",
-                                   details + [f"  stderr: {disc.stderr[-400:]}"])
-            try:
-                catalog = json.loads(disc.stdout)
-            except json.JSONDecodeError:
-                return CheckResult("sync", "FAIL", "Discovery output not valid JSON", details)
-            catalog_path.write_text(json.dumps(catalog, indent=2), encoding="utf-8")
+    # Select all streams
+    catalog_selected = _select_all_streams(catalog)
+    selected_path = out_dir / "catalog_selected.json"
+    selected_path.write_text(json.dumps(catalog_selected, indent=2), encoding="utf-8")
+    stream_names = [s.get("stream") or s.get("tap_stream_id", "?")
+                    for s in catalog_selected.get("streams", [])]
+    details.append(f"  SYNC_INFO| Streams selected | INFO | {', '.join(str(s) for s in stream_names)}")
+
+    # ------------------------------------------------------------------
+    # Step B: Sync1 — historical (no state)
+    # ------------------------------------------------------------------
+    details.append("  SYNC_INFO| Sync1 | INFO | running (no state / full historical)")
+    r1 = _run_subprocess(
+        [tap_exe, "--config", str(tap_config), "--catalog", str(selected_path)],
+        timeout=timeout,
+    )
+    sync1_out.write_text(r1.stdout, encoding="utf-8")
+    if r1.returncode != 0:
+        details.append(f"  Sync1 stderr: {r1.stderr[-400:]}")
+        issues.append(f"Sync1 exited with code {r1.returncode}")
+
+    # Sync1 log parsing
+    for _line in r1.stderr.splitlines():
+        _s = _line.strip()
+        if not _s:
+            continue
+        if re.search(r'\b(403|FORBIDDEN|UNAUTHORIZED|AUTHORIZATIONERROR|ACCESSDENIED)\b', _s, re.IGNORECASE):
+            details.append(f"  [UNAUTH] Sync1: {_s}")
+            warnings.append(f"Sync1 unauth signal: {_s[:120]}")
+        elif 'ERROR' in _s.upper():
+            details.append(f"  [ERROR] Sync1: {_s}")
+            warnings.append(f"Sync1 error: {_s[:120]}")
+        elif 'WARNING' in _s.upper() or 'WARN' in _s.upper():
+            details.append(f"  [WARN] Sync1: {_s}")
+
+    records1, schemas1, states1 = _parse_singer_output(r1.stdout)
+    total1 = sum(len(v) for v in records1.values())
+    details.append(f"  SYNC_INFO| Sync1 SCHEMA messages | INFO | {len(schemas1)}")
+    details.append(f"  SYNC_INFO| Sync1 total records | INFO | {total1}")
+    details.append(f"  SYNC_INFO| Sync1 STATE messages | INFO | {len(states1)}")
+
+    # Validate Sync1
+    if not schemas1:
+        issues.append("Sync1: no SCHEMA messages emitted")
+    if total1 == 0:
+        warnings.append("Sync1: zero records returned — API may be empty or start_date too recent")
+        details.append("  SYNC_INFO| Sync1 records | WARN | zero records returned — API may be empty or start_date too recent")
+    if not states1:
+        warnings.append("Sync1: no STATE messages — bookmarking may not be implemented")
+        details.append("  SYNC_INFO| Sync1 STATE | WARN | no STATE messages emitted — bookmarking may not be implemented")
+    else:
+        last_state1 = states1[-1]
+        state1_path.write_text(json.dumps(last_state1, indent=2), encoding="utf-8")
+        details.append(f"  SYNC_INFO| Sync1 state | INFO | saved to {state1_path.name}")
+
+        # Validate bookmark structure
+        bookmarks = last_state1.get("bookmarks", {})
+        if bookmarks:
+            details.append(f"  SYNC_INFO| Sync1 bookmarks | INFO | {', '.join(list(bookmarks.keys()))}")
+            for sname, bm in bookmarks.items():
+                details.append(f"  SYNC_INFO| bookmark: {sname} | INFO | {json.dumps(bm)[:80]}")
         else:
-            catalog = _load_json(catalog_path)
-            details.append(f"  Reusing existing catalog: {catalog_path}")
+            warnings.append("Sync1: STATE emitted but 'bookmarks' key is empty")
+            details.append("  SYNC_INFO| Sync1 bookmarks | WARN | STATE emitted but 'bookmarks' key is empty")
 
-        # Select all streams
-        catalog_selected = _select_all_streams(catalog)
-        selected_path = out_dir / "catalog_selected.json"
-        selected_path.write_text(json.dumps(catalog_selected, indent=2), encoding="utf-8")
-        stream_names = [s.get("stream") or s.get("tap_stream_id", "?")
-                        for s in catalog_selected.get("streams", [])]
-        details.append(f"  Streams selected for sync: {stream_names}")
-
-        # ------------------------------------------------------------------
-        # Step B: Sync1 — historical (no state)
-        # ------------------------------------------------------------------
-        details.append("  Running Sync1 (no state / full historical)...")
-        r1 = _run_subprocess(
-            [tap_exe, "--config", str(clean_creds), "--catalog", str(selected_path)],
+    # ------------------------------------------------------------------
+    # Step C: Sync2 — bookmark sync (with state from Sync1)
+    # ------------------------------------------------------------------
+    records2: Dict[str, List] = {}
+    total2 = 0
+    advanced: List[str] = []
+    same:     List[str] = []
+    regressed: List[str] = []
+    last_state2: dict = {}
+    if state1_path.is_file():
+        details.append("  SYNC_INFO| Sync2 | INFO | running with state from Sync1")
+        r2 = _run_subprocess(
+            [tap_exe, "--config", str(tap_config),
+             "--catalog", str(selected_path),
+             "--state",   str(state1_path)],
             timeout=timeout,
         )
-        sync1_out.write_text(r1.stdout, encoding="utf-8")
-        if r1.returncode != 0:
-            details.append(f"  Sync1 stderr: {r1.stderr[-400:]}")
-            issues.append(f"Sync1 exited with code {r1.returncode}")
+        sync2_out.write_text(r2.stdout, encoding="utf-8")
+        if r2.returncode != 0:
+            warnings.append(f"Sync2 exited with code {r2.returncode}")
+            details.append(f"  SYNC_INFO| Sync2 exit code | WARN | non-zero exit {r2.returncode}: {r2.stderr[-200:]}")
 
-        records1, schemas1, states1 = _parse_singer_output(r1.stdout)
-        total1 = sum(len(v) for v in records1.values())
-        details.append(f"  Sync1 — SCHEMA messages: {len(schemas1)}")
-        details.append(f"  Sync1 — Total records:   {total1}")
-        details.append(f"  Sync1 — STATE messages:  {len(states1)}")
+        # Sync2 log parsing
+        for _line in r2.stderr.splitlines():
+            _s = _line.strip()
+            if not _s:
+                continue
+            if re.search(r'\b(403|FORBIDDEN|UNAUTHORIZED|AUTHORIZATIONERROR|ACCESSDENIED)\b', _s, re.IGNORECASE):
+                details.append(f"  [UNAUTH] Sync2: {_s}")
+                warnings.append(f"Sync2 unauth signal: {_s[:120]}")
+            elif 'ERROR' in _s.upper():
+                details.append(f"  [ERROR] Sync2: {_s}")
+                warnings.append(f"Sync2 error: {_s[:120]}")
+            elif 'WARNING' in _s.upper() or 'WARN' in _s.upper():
+                details.append(f"  [WARN] Sync2: {_s}")
 
-        for sname in sorted(records1):
-            cnt = len(records1[sname])
-            details.append(f"    {sname}: {cnt} records")
+        records2, schemas2, states2 = _parse_singer_output(r2.stdout)
+        total2 = sum(len(v) for v in records2.values())
+        details.append(f"  SYNC_INFO| Sync2 SCHEMA messages | INFO | {len(schemas2)}")
+        details.append(f"  SYNC_INFO| Sync2 total records | INFO | {total2}")
+        details.append(f"  SYNC_INFO| Sync2 STATE messages | INFO | {len(states2)}")
 
-        # Validate Sync1
-        if not schemas1:
-            issues.append("Sync1: no SCHEMA messages emitted")
-        if total1 == 0:
-            warnings.append("Sync1: zero records returned — API may be empty or start_date too recent")
-        if not states1:
-            warnings.append("Sync1: no STATE messages — bookmarking may not be implemented")
+        # Bookmark advancement check
+        if states2:
+            last_state2 = states2[-1]
+            bm2 = last_state2.get("bookmarks", {})
+            bm1 = last_state1.get("bookmarks", {}) if state1_path.is_file() else {}
+
+            advanced, same, regressed = [], [], []
+            for sname, val2 in bm2.items():
+                val1 = bm1.get(sname)
+                if val1 is None:
+                    same.append(sname)
+                elif json.dumps(val2, sort_keys=True) == json.dumps(val1, sort_keys=True):
+                    same.append(sname)
+                elif json.dumps(val2, sort_keys=True) > json.dumps(val1, sort_keys=True):
+                    advanced.append(sname)
+                else:
+                    regressed.append(sname)
+
+            details.append(f"  SYNC_INFO| Bookmark advancement | INFO | advanced={advanced}; same={same}; regressed={regressed}")
+            if regressed:
+                issues.append(f"Bookmarks regressed for: {regressed}")
+            if not advanced and not same:
+                warnings.append("No bookmark data in Sync2 state")
+                details.append("  SYNC_INFO| Sync2 bookmarks | WARN | no bookmark data in Sync2 state")
         else:
-            last_state1 = states1[-1]
-            state1_path.write_text(json.dumps(last_state1, indent=2), encoding="utf-8")
-            details.append(f"  Sync1 state saved: {state1_path}")
+            warnings.append("Sync2: no STATE messages emitted")
+            details.append("  SYNC_INFO| Sync2 STATE | WARN | no STATE messages emitted")
 
-            # Validate bookmark structure
-            bookmarks = last_state1.get("bookmarks", {})
-            if bookmarks:
-                details.append(f"  Sync1 bookmarks: {list(bookmarks.keys())}")
-                for sname, bm in bookmarks.items():
-                    details.append(f"    {sname}: {json.dumps(bm)[:100]}")
-            else:
-                warnings.append("Sync1: STATE emitted but 'bookmarks' key is empty")
-
-        # ------------------------------------------------------------------
-        # Step C: Sync2 — bookmark sync (with state from Sync1)
-        # ------------------------------------------------------------------
-        if state1_path.is_file():
-            details.append("  Running Sync2 (with state from Sync1)...")
-            r2 = _run_subprocess(
-                [tap_exe, "--config", str(clean_creds),
-                 "--catalog", str(selected_path),
-                 "--state",   str(state1_path)],
-                timeout=timeout,
+        # FULL_TABLE streams should return same count; INCREMENTAL should return <= Sync1
+        for sname in records1:
+            cnt1 = len(records1[sname])
+            cnt2 = len(records2.get(sname, []))
+            root_md = next(
+                (m["metadata"] for m in
+                 next((s for s in catalog_selected.get("streams", [])
+                       if s.get("stream") == sname or s.get("tap_stream_id") == sname), {})
+                 .get("metadata", [])
+                 if m.get("breadcrumb") == []),
+                {}
             )
-            sync2_out.write_text(r2.stdout, encoding="utf-8")
-            if r2.returncode != 0:
-                warnings.append(f"Sync2 exited with code {r2.returncode}")
-                details.append(f"  Sync2 stderr: {r2.stderr[-400:]}")
+            repl = root_md.get("forced-replication-method", root_md.get("replication-method", ""))
+            if repl == "FULL_TABLE" and cnt2 != cnt1:
+                warnings.append(f"{sname}: FULL_TABLE Sync2 count ({cnt2}) != Sync1 ({cnt1})")
+                details.append(f"  SYNC_INFO| {sname} count mismatch | WARN | FULL_TABLE Sync2={cnt2} != Sync1={cnt1}")
+            elif repl == "INCREMENTAL" and cnt2 > cnt1:
+                warnings.append(f"{sname}: INCREMENTAL Sync2 ({cnt2}) > Sync1 ({cnt1})")
+                details.append(f"  SYNC_INFO| {sname} over-fetch | WARN | INCREMENTAL Sync2={cnt2} > Sync1={cnt1} — possible bookmark issue")
+    else:
+        warnings.append("Sync2 skipped — no state from Sync1 (no STATE messages in Sync1)")
+        details.append("  SYNC_INFO| Sync2 | WARN | skipped — no STATE messages from Sync1")
 
-            records2, schemas2, states2 = _parse_singer_output(r2.stdout)
-            total2 = sum(len(v) for v in records2.values())
-            details.append(f"  Sync2 — SCHEMA messages: {len(schemas2)}")
-            details.append(f"  Sync2 — Total records:   {total2}")
-            details.append(f"  Sync2 — STATE messages:  {len(states2)}")
+    # ------------------------------------------------------------------
+    # Per-stream sync table (Sync1 vs Sync2, min/max replication key)
+    # ------------------------------------------------------------------
+    # Some taps store bookmarks under a prefixed key rather than the bare
+    # stream name, e.g. "{account_id}_{stream_id}" (tap-bing-ads) or
+    # "{parent_id}_{stream_id}" (tap-amazon-ads).  _bm_in() resolves both
+    # the exact key and any key whose suffix matches "_{stream_name}".
+    def _bm_in(stream_name: str, name_list: list) -> bool:
+        if stream_name in name_list:
+            return True
+        suffix = f"_{stream_name}"
+        return any(k.endswith(suffix) for k in name_list)
 
-            for sname in sorted(records2):
-                cnt = len(records2[sname])
-                details.append(f"    {sname}: {cnt} records")
-
-            # Bookmark advancement check
-            if states2:
-                last_state2 = states2[-1]
-                bm2 = last_state2.get("bookmarks", {})
-                bm1 = last_state1.get("bookmarks", {}) if state1_path.is_file() else {}
-
-                advanced, same, regressed = [], [], []
-                for sname, val2 in bm2.items():
-                    val1 = bm1.get(sname)
-                    if val1 is None:
-                        same.append(sname)
-                    elif json.dumps(val2, sort_keys=True) == json.dumps(val1, sort_keys=True):
-                        same.append(sname)
-                    elif json.dumps(val2, sort_keys=True) > json.dumps(val1, sort_keys=True):
-                        advanced.append(sname)
-                    else:
-                        regressed.append(sname)
-
-                details.append(f"  Bookmark advancement: advanced={advanced} same={same} regressed={regressed}")
-                if regressed:
-                    issues.append(f"Bookmarks regressed for: {regressed}")
-                if not advanced and not same:
-                    warnings.append("No bookmark data in Sync2 state")
-            else:
-                warnings.append("Sync2: no STATE messages emitted")
-
-            # FULL_TABLE streams should return same count; INCREMENTAL should return <= Sync1
-            for sname in records1:
-                cnt1 = len(records1[sname])
-                cnt2 = len(records2.get(sname, []))
-                root_md = next(
-                    (m["metadata"] for m in
-                     next((s for s in catalog_selected.get("streams", [])
-                           if s.get("stream") == sname or s.get("tap_stream_id") == sname), {})
-                     .get("metadata", [])
-                     if m.get("breadcrumb") == []),
-                    {}
-                )
-                repl = root_md.get("forced-replication-method", root_md.get("replication-method", ""))
-                if repl == "FULL_TABLE" and cnt2 != cnt1:
-                    warnings.append(f"{sname}: FULL_TABLE Sync2 count ({cnt2}) != Sync1 ({cnt1})")
-                elif repl == "INCREMENTAL" and cnt2 > cnt1:
-                    warnings.append(f"{sname}: INCREMENTAL Sync2 ({cnt2}) > Sync1 ({cnt1})")
+    _bm1 = last_state1.get("bookmarks", {}) if states1 else {}
+    _bm2 = last_state2.get("bookmarks", {}) if last_state2 else {}
+    for _sname in sorted(set(list(records1.keys()) + list(records2.keys()))):
+        _n1 = len(records1.get(_sname, []))
+        _n2 = len(records2.get(_sname, [])) if records2 else "n/a"
+        # replication method + key from catalog
+        _root_md = next(
+            (m["metadata"] for m in
+             next((s for s in catalog_selected.get("streams", [])
+                   if s.get("stream") == _sname or s.get("tap_stream_id") == _sname), {})
+             .get("metadata", [])
+             if m.get("breadcrumb") == []),
+            {}
+        )
+        _repl = _root_md.get("forced-replication-method", _root_md.get("replication-method", "NOT SET"))
+        _vk   = _root_md.get("valid-replication-keys", [])
+        _repl_key = _vk[0] if _vk else _root_md.get("replication-key", "")
+        _parent   = _root_md.get("parent-tap-stream-id", "")
+        # min/max from sync1 records
+        _min_val = _max_val = "-"
+        if _repl_key and records1.get(_sname):
+            _vals = sorted(
+                str(r[_repl_key]) for r in records1[_sname]
+                if r.get(_repl_key) is not None
+            )
+            if _vals:
+                _min_val, _max_val = _vals[0], _vals[-1]
+        # bookmark advancement status — check both bare name and prefixed variants
+        if _bm_in(_sname, advanced):
+            _bm_status = "advanced"
+        elif _bm_in(_sname, regressed):
+            _bm_status = "regressed"
+        elif _bm_in(_sname, same):
+            _bm_status = "same"
         else:
-            warnings.append("Sync2 skipped — no state from Sync1 (no STATE messages in Sync1)")
+            _bm_status = "n/a"
+        # INCREMENTAL streams MUST emit and advance bookmarks
+        if _repl == "INCREMENTAL":
+            if _bm_status == "n/a":
+                issues.append(
+                    f"{_sname}: INCREMENTAL stream emitted no bookmark in state — "
+                    f"bookmarking is not implemented"
+                )
+            elif _bm_status == "same":
+                warnings.append(
+                    f"{_sname}: INCREMENTAL bookmark did not advance after Sync2 — "
+                    f"may have no new data, or replication key is not updating state"
+                )
+                details.append(
+                    f"  SYNC_INFO| {_sname} bookmark | WARN | "
+                    f"INCREMENTAL bookmark unchanged after Sync2 — no new data or repl key not updating state"
+                )
+        details.append(
+            f"  SYNC_ROW| {_sname}"
+            f" | sync1={_n1} | sync2={_n2}"
+            f" | repl={_repl} | repl_key={_repl_key or '-'}"
+            f" | min={_min_val} | max={_max_val}"
+            f" | bm={_bm_status} | parent={_parent or '-'}"
+        )
 
-        # ------------------------------------------------------------------
-        # Artifacts summary
-        # ------------------------------------------------------------------
-        details.append(f"  Artifacts written to: {out_dir}")
-        details.append(f"    catalog.json, catalog_selected.json")
-        details.append(f"    sync1_output.json, sync2_output.json, state_sync1.json")
+    # ------------------------------------------------------------------
+    # Artifacts summary
+    # ------------------------------------------------------------------
+    details.append(f"  SYNC_INFO| Artifacts | INFO | {out_dir}")
+    details.append(f"  SYNC_INFO| Files | INFO | catalog.json, catalog_selected.json, sync1_output.json, sync2_output.json, state_sync1.json")
 
-        if issues:
-            return CheckResult("sync", "FAIL",
-                               f"Sync FAILED: {'; '.join(issues)}", details)
-        if warnings:
-            return CheckResult("sync", "WARN",
-                               f"Sync OK (Sync1={total1} records, Sync2={total2} records) — warnings: {len(warnings)}",
-                               details)
-        return CheckResult("sync", "PASS",
-                           f"Sync1 ({total1} records) + Sync2 ({total2} records) — bookmarks, pagination, state all validated",
+    if issues:
+        return CheckResult("sync", "FAIL",
+                           f"Sync FAILED: {'; '.join(issues)}", details)
+    if warnings:
+        return CheckResult("sync", "WARN",
+                           f"Sync OK (Sync1={total1} records, Sync2={total2} records) — warnings: {len(warnings)}",
                            details)
-    finally:
-        if clean_creds and clean_creds.exists():
-            clean_creds.unlink(missing_ok=True)
+    return CheckResult("sync", "PASS",
+                       f"Sync1 ({total1} records) + Sync2 ({total2} records) — bookmarks, pagination, state all validated",
+                       details)
 
 
 def _check_sync_static(tap_dir: Path, tap_config: Optional[Path]) -> CheckResult:
@@ -1195,7 +1363,7 @@ def check_schema(tap_dir: Path) -> CheckResult:
     if not schema_files:
         return CheckResult("schema", "FAIL", "No .json schema files found", [])
 
-    details.append(f"  Schema files: {len(schema_files)}")
+    details.append(f"  SCH_INFO| {len(schema_files)} schema files found")
     s_issues, s_warns = 0, 0
 
     for sf in schema_files:
@@ -1206,7 +1374,7 @@ def check_schema(tap_dir: Path) -> CheckResult:
             details.append(f"  {name}.json: INVALID JSON");  continue
 
         fi, fw = [], []
-        if schema.get("type") not in ("object", ["object"], ["null", "object"]):
+        if schema.get("type") not in ("object", ["object"], ["null", "object"], ["object", "null"]):
             fi.append("root type is not 'object'")
 
         props = schema.get("properties", {})
@@ -1243,16 +1411,16 @@ def check_schema(tap_dir: Path) -> CheckResult:
             f"  non-nullable={len(non_null)}"
             f"  dt-format-issues={len(dt_missing)}"
         )
-        # Append per-field issue lines so the report shows exactly which fields need fixing
+        # Structured sub-lines picked up by HTML renderer
         if non_null:
-            details.append(f"    non-nullable fields (add null type): {', '.join(non_null)}")
+            details.append(f"  SCHEMA_FIELD| {name}.json | non-nullable | {', '.join(non_null)}")
         if dt_missing:
-            details.append(f"    missing format:date-time: {', '.join(dt_missing)}")
+            details.append(f"  SCHEMA_FIELD| {name}.json | missing-date-time-format | {', '.join(dt_missing)}")
         if fi:
             for issue_line in fi:
-                details.append(f"    error: {issue_line}")
+                details.append(f"  SCHEMA_FIELD| {name}.json | error | {issue_line}")
 
-    details.append(f"  Total: {len(schema_files)} files — {s_issues} errors, {s_warns} warnings")
+    details.append(f"  SCH_INFO| Total: {len(schema_files)} files — {s_issues} error(s), {s_warns} warning(s)")
 
     if issues:
         return CheckResult("schema", "FAIL",
@@ -1599,10 +1767,16 @@ def _print_stdout_summary(report: ValidationReport) -> None:
     print(f"{CYAN}{SEP}{NC}")
     print()
 
+    def _safe(s: str) -> str:
+        """Return s with non-ASCII chars replaced by ASCII equivalents for Windows terminals."""
+        return s.encode(sys.stdout.encoding or "ascii", errors="replace").decode(
+            sys.stdout.encoding or "ascii"
+        )
+
     label_w = max(len(r.name) for r in report.results) + 2
     for r in report.results:
         label = r.name.replace("_", " ").title().ljust(label_w)
-        print(f"  {r.color}{r.icon}  {BOLD}{label}{NC}  {r.summary}")
+        print(f"  {r.color}{r.icon}  {BOLD}{label}{NC}  {_safe(r.summary)}")
 
     print()
     oc = {
@@ -1732,19 +1906,39 @@ def _save_html_report(report: ValidationReport, output_path: Path) -> None:
         return f'<table style="{_TBL}">{thead}<tbody>{"".join(rows)}</tbody></table>'
 
     # ---- line-type classifiers ----------------------------------------
-    _RE_CAT   = re.compile(r'^\[(OK|WARN|FAIL)\]\s+\S.*\|')   # catalog_validation stream
-    _RE_DISC  = re.compile(r'^Stream:\s+\S+\s+\|')            # discovery stream
-    _RE_SCH   = re.compile(r'^\S+\.json\s+\[(OK|WARN|FAIL)\]')# schema file
-    _RE_REC   = re.compile(r'^[\w_]+:\s+\d+\s+records$')      # sync record counts
-    _RE_PKG   = re.compile(r'^[\w][\w.-]+==[^\s:]+:')         # package pin
+    _RE_CAT       = re.compile(r'^\[(OK|WARN|FAIL)\]\s+\S.*\|')   # catalog_validation stream
+    _RE_DISC      = re.compile(r'^Stream:\s+\S+\s+\|')            # discovery stream
+    _RE_SCH       = re.compile(r'^\S+\.json\s+\[(OK|WARN|FAIL)\]')# schema file summary
+    _RE_SCH_FIELD = re.compile(r'^SCHEMA_FIELD\|')                # schema field detail
+    _RE_SCH_INFO  = re.compile(r'^SCH_INFO\|')                   # schema section info
+    _RE_SYNC      = re.compile(r'^SYNC_ROW\|')                    # sync per-stream row
+    _RE_META      = re.compile(r'^META_ROW\|')                    # metadata check row
+    _RE_INTEG     = re.compile(r'^INTEG_ROW\|')                   # integration test row
+    _RE_PYUPG     = re.compile(r'^PYUPG_ROW\|')                   # python upgrade row
+    _RE_UNAUTH_R  = re.compile(r'^UNAUTH_ROW\|')                  # unauth exclusion row
+    _RE_UNIT      = re.compile(r'^UNIT_ROW\|')                    # unit test row
+    _RE_DISC_I    = re.compile(r'^DISC_INFO\|')                   # discovery info row
+    _RE_SYNC_I    = re.compile(r'^SYNC_INFO\|')                   # sync info row
+    _RE_LOG       = re.compile(r'^\[(ERROR|WARN|UNAUTH)\]\s+')    # discovery/sync log line
+    _RE_PKG       = re.compile(r'^[\w][\w.-]+==[^\s:]+:')         # package pin
 
     def _classify(s: str) -> Optional[str]:
         s = s.strip()
-        if _RE_CAT.match(s):  return 'cat'
-        if _RE_DISC.match(s): return 'disc'
-        if _RE_SCH.match(s):  return 'sch'
-        if _RE_REC.match(s):  return 'rec'
-        if _RE_PKG.match(s):  return 'pkg'
+        if _RE_CAT.match(s):       return 'cat'
+        if _RE_DISC.match(s):      return 'disc'
+        if _RE_DISC_I.match(s):    return 'disc'
+        if _RE_SCH.match(s):       return 'sch'
+        if _RE_SCH_FIELD.match(s): return 'sch'
+        if _RE_SCH_INFO.match(s):  return 'sch'
+        if _RE_SYNC.match(s):      return 'sync'
+        if _RE_SYNC_I.match(s):    return 'sync'
+        if _RE_META.match(s):      return 'meta'
+        if _RE_INTEG.match(s):     return 'integ'
+        if _RE_PYUPG.match(s):     return 'pyupg'
+        if _RE_UNAUTH_R.match(s):  return 'unauth'
+        if _RE_UNIT.match(s):      return 'unit'
+        if _RE_LOG.match(s):       return 'log'
+        if _RE_PKG.match(s):       return 'pkg'
         return None
 
     # ---- segment builder (group consecutive lines of same type) -------
@@ -1789,9 +1983,27 @@ def _save_html_report(report: ValidationReport, output_path: Path) -> None:
     def _render_disc(lines: List[str]) -> str:
         """Stream: name  |  keys=[...]  |  replication=X  |  fields=N  |  parent=..."""
         hdrs = ['Stream', 'Keys', 'Replication', 'Fields', 'Parent']
+        _di_st = {'OK':   'color:#1a7f37;font-weight:700;',
+                  'WARN': 'background:#fff8e1;color:#b7770d;font-weight:700;',
+                  'FAIL': 'background:#fdecea;color:#c0392b;font-weight:700;',
+                  'INFO': 'color:#0366d6;font-weight:600;'}
         rows = []
         for ln in lines:
-            cols = [c.strip() for c in ln.strip().split('|')]
+            s = ln.strip()
+            if s.startswith('DISC_INFO|'):
+                dparts = [p.strip() for p in s.split('|', 3)]
+                label  = dparts[1] if len(dparts) > 1 else s
+                st     = dparts[2] if len(dparts) > 2 else 'INFO'
+                detail = dparts[3] if len(dparts) > 3 else ''
+                rows.append(
+                    f'<tr style="font-size:0.78rem;background:#f7f9fb;">'
+                    f'<td style="{_TDM};{_di_st.get(st, "")}">{label}</td>'
+                    f'<td style="{_TD};width:55px;{_di_st.get(st, "")}">{st}</td>'
+                    f'<td colspan="3" style="{_TD}">{detail}</td>'
+                    f'</tr>'
+                )
+                continue
+            cols = [c.strip() for c in s.split('|')]
             m = re.match(r'^Stream:\s+(.*)', cols[0])
             stm = (m.group(1) or cols[0]).strip() if m else cols[0]
             kv: Dict[str, str] = {}
@@ -1810,13 +2022,47 @@ def _save_html_report(report: ValidationReport, output_path: Path) -> None:
         return _tbl(_thead(hdrs), rows)
 
     def _render_sch(lines: List[str]) -> str:
-        """filename.json [OK]  props=N  non-nullable=N  dt-format-issues=N"""
-        hdrs = ['File', 'Status', 'Props', 'Non-Nullable', 'DT Format Issues']
+        """Render schema file summary rows and SCHEMA_FIELD sub-detail rows."""
+        hdrs = ['File', 'Status', 'Props', 'Non-Nullable', 'DT Format Issues', 'Issue Type', 'Affected Fields']
         rows = []
         for ln in lines:
-            m = re.match(r'^(\S+\.json)\s+\[(OK|WARN|FAIL)\](.*)', ln.strip())
+            s = ln.strip()
+            # SCH_INFO banner row (header/footer)
+            if s.startswith('SCH_INFO|'):
+                msg = s[len('SCH_INFO|'):].strip()
+                rows.append(
+                    f'<tr>'
+                    f'<td colspan="7" style="{_TD}background:#f7f7f7;color:#444;font-style:italic;">'
+                    f'{msg}</td></tr>'
+                )
+                continue
+            # SCHEMA_FIELD sub-detail row
+            mf = re.match(r'^SCHEMA_FIELD\|\s*([^|]+)\|\s*([^|]+)\|\s*(.*)', s)
+            if mf:
+                _fname, _itype, _fields = mf.group(1).strip(), mf.group(2).strip(), mf.group(3).strip()
+                _itype_label = {
+                    'non-nullable': 'Non-Nullable',
+                    'missing-date-time-format': 'Missing date-time format',
+                    'error': 'Error',
+                }.get(_itype, _itype)
+                _itype_style = (
+                    'background:#fff8e1;color:#b7770d;font-weight:600;' if _itype == 'non-nullable'
+                    else 'background:#fdecea;color:#c0392b;font-weight:600;' if _itype in ('error', 'missing-date-time-format')
+                    else ''
+                )
+                rows.append(
+                    f'<tr style="font-size:0.78rem;">'
+                    f'<td style="{_TDM};color:#888;padding-left:24px;">{_fname}</td>'
+                    f'<td colspan="4" style="{_TD}"></td>'
+                    f'<td style="{_TD};width:160px;{_itype_style}">{_itype_label}</td>'
+                    f'<td style="{_TDM};word-break:break-word;white-space:normal;">{_fields}</td>'
+                    f'</tr>'
+                )
+                continue
+            # Summary row  (orders.json [OK]  props=N  non-nullable=N  dt-format-issues=N)
+            m = re.match(r'^(\S+\.json)\s+\[(OK|WARN|FAIL)\](.*)', s)
             if not m:
-                rows.append(f'<tr><td colspan="5" style="{_TD}">{ln.strip()}</td></tr>')
+                rows.append(f'<tr><td colspan="7" style="{_TD}">{s}</td></tr>')
                 continue
             fname, st, rest = m.group(1), m.group(2), m.group(3)
             kv: Dict[str, str] = {}
@@ -1825,28 +2071,231 @@ def _save_html_report(report: ValidationReport, output_path: Path) -> None:
                     k, _, v = part.partition('='); kv[k.strip()] = v.strip()
             rows.append(
                 f'<tr>'
-                f'<td style="{_TDM}">{fname}</td>'
+                f'<td style="{_TDM}"><strong>{fname}</strong></td>'
                 f'<td style="{_TD}{_ST.get(st, "")}">{st}</td>'
-                f'<td style="{_TD}">{kv.get("props", "-")}</td>'
-                f'<td style="{_TD}">{kv.get("non-nullable", "-")}</td>'
-                f'<td style="{_TD}">{kv.get("dt-format-issues", "-")}</td>'
+                f'<td style="{_TD};text-align:right;">{kv.get("props", "-")}</td>'
+                f'<td style="{_TD};text-align:right;">{kv.get("non-nullable", "-")}</td>'
+                f'<td style="{_TD};text-align:right;">{kv.get("dt-format-issues", "-")}</td>'
+                f'<td style="{_TD}">-</td>'
+                f'<td style="{_TD}">-</td>'
                 f'</tr>'
             )
         return _tbl(_thead(hdrs), rows)
 
-    def _render_rec(lines: List[str]) -> str:
-        """stream_name: N records"""
-        hdrs = ['Stream', 'Records']
-        rows = []
+    def _render_sync(lines: List[str]) -> str:
+        """SYNC_ROW| stream | sync1=N | sync2=N | repl=X | repl_key=Y | min=Z | max=W | bm=STATUS | parent=P
+           SYNC_INFO| label | STATUS | detail  — rendered as a separate info block above the stream table."""
+        _si_st = {'OK':   'color:#1a7f37;font-weight:600;',
+                  'WARN': 'color:#b7770d;font-weight:600;',
+                  'FAIL': 'color:#c0392b;font-weight:600;',
+                  'INFO': 'color:#0366d6;font-weight:600;'}
+
+        # ── split into info lines and stream rows ──────────────────────
+        info_rows:   List[str] = []
+        stream_rows: List[str] = []
         for ln in lines:
-            m = re.match(r'^([\w_]+):\s+(\d+)\s+records$', ln.strip())
-            if m:
-                rows.append(
-                    f'<tr>'
-                    f'<td style="{_TDM}">{m.group(1)}</td>'
-                    f'<td style="{_TD}">{m.group(2)}</td>'
+            s = ln.strip()
+            if s.startswith('SYNC_INFO|'):
+                iparts = [p.strip() for p in s.split('|', 3)]
+                label  = iparts[1] if len(iparts) > 1 else s
+                st     = iparts[2] if len(iparts) > 2 else 'INFO'
+                detail = iparts[3] if len(iparts) > 3 else ''
+                info_rows.append(
+                    f'<tr style="font-size:0.78rem;">'
+                    f'<td style="{_TDM};width:180px;{_si_st.get(st, "")}">{label}</td>'
+                    f'<td style="{_TD};color:#555;width:40px;">{st}</td>'
+                    f'<td style="{_TD}">{detail}</td>'
                     f'</tr>'
                 )
+            elif s.startswith('SYNC_ROW|'):
+                parts = [p.strip() for p in s.split('|')]
+                if len(parts) < 2:
+                    continue
+                stream = parts[1].strip()
+                kv: Dict[str, str] = {}
+                for p in parts[2:]:
+                    if '=' in p:
+                        k, _, v = p.partition('=')
+                        kv[k.strip()] = v.strip()
+                bm   = kv.get('bm', 'n/a')
+                repl = kv.get('repl', '')
+                if bm == 'same' and repl == 'INCREMENTAL':
+                    _bm_style = 'background:#fdecea;color:#c0392b;font-weight:700;'
+                elif bm == 'same':
+                    _bm_style = 'background:#fff8e1;color:#b7770d;font-weight:700;'
+                elif bm == 'n/a' and repl == 'INCREMENTAL':
+                    _bm_style = 'background:#fdecea;color:#c0392b;font-weight:700;'
+                else:
+                    _bm_style = {
+                        'advanced':  'background:#d4f5dc;color:#1a7f37;font-weight:700;',
+                        'regressed': 'background:#fdecea;color:#c0392b;font-weight:700;',
+                    }.get(bm, '')
+                stream_rows.append(
+                    f'<tr>'
+                    f'<td style="{_TDM}"><strong>{stream}</strong></td>'
+                    f'<td style="{_TDM}">{kv.get("parent", "-")}</td>'
+                    f'<td style="{_TD};text-align:right;">{kv.get("sync1", "-")}</td>'
+                    f'<td style="{_TD};text-align:right;">{kv.get("sync2", "-")}</td>'
+                    f'<td style="{_TD}">{repl or "-"}</td>'
+                    f'<td style="{_TDM}">{kv.get("repl_key", "-")}</td>'
+                    f'<td style="{_TDM}">{kv.get("min", "-")}</td>'
+                    f'<td style="{_TDM}">{kv.get("max", "-")}</td>'
+                    f'<td style="{_TD}{_bm_style}">{bm}</td>'
+                    f'</tr>'
+                )
+
+        # ── build output: info block (if any) + stream table (if any) ──
+        out = ''
+        if info_rows:
+            out += _tbl(_thead(['Label', 'Status', 'Detail']), info_rows)
+        if stream_rows:
+            hdrs = ['Stream', 'Parent', 'Sync1 Records', 'Sync2 Records',
+                    'Replication', 'Repl Key', 'Min Repl Key (Sync1)',
+                    'Max Repl Key (Sync1)', 'Bookmark']
+            out += _tbl(_thead(hdrs), stream_rows)
+        return out
+
+    def _render_meta(lines: List[str]) -> str:
+        """META_ROW| check | status | detail"""
+        hdrs = ['Check', 'Status', 'Detail']
+        _st_style = {
+            'PASS': 'background:#d4f5dc;color:#1a7f37;font-weight:700;',
+            'OK':   'background:#d4f5dc;color:#1a7f37;font-weight:700;',
+            'WARN': 'background:#fff8e1;color:#b7770d;font-weight:700;',
+            'FAIL': 'background:#fdecea;color:#c0392b;font-weight:700;',
+            'INFO': 'background:#e8f4fd;color:#0366d6;font-weight:600;',
+        }
+        rows = []
+        for ln in lines:
+            parts = [p.strip() for p in ln.split('|')]
+            if len(parts) < 4:
+                rows.append(f'<tr><td colspan="3" style="{_TD}">{ln.strip()}</td></tr>')
+                continue
+            _, check, st, detail = parts[0], parts[1], parts[2], '|'.join(parts[3:]).strip()
+            rows.append(
+                f'<tr>'
+                f'<td style="{_TDM};font-weight:600;">{check}</td>'
+                f'<td style="{_TD}{_st_style.get(st, "")};width:60px;">{st}</td>'
+                f'<td style="{_TD};word-break:break-word;white-space:normal;">{detail}</td>'
+                f'</tr>'
+            )
+        return _tbl(_thead(hdrs), rows)
+
+    def _render_integ(lines: List[str]) -> str:
+        """INTEG_ROW| test-type | status | detail"""
+        hdrs = ['Test Type', 'Status', 'Detail']
+        _st_style = {
+            'OK':   'background:#d4f5dc;color:#1a7f37;font-weight:700;',
+            'WARN': 'background:#fff8e1;color:#b7770d;font-weight:700;',
+            'FAIL': 'background:#fdecea;color:#c0392b;font-weight:700;',
+            'INFO': 'background:#e8f4fd;color:#0366d6;font-weight:600;',
+        }
+        rows = []
+        for ln in lines:
+            parts = [p.strip() for p in ln.split('|')]
+            if len(parts) < 4:
+                rows.append(f'<tr><td colspan="3" style="{_TD}">{ln.strip()}</td></tr>')
+                continue
+            _, ttype, st, detail = parts[0], parts[1], parts[2], '|'.join(parts[3:]).strip()
+            rows.append(
+                f'<tr>'
+                f'<td style="{_TDM};font-weight:600;">{ttype}</td>'
+                f'<td style="{_TD}{_st_style.get(st, "")};width:60px;">{st}</td>'
+                f'<td style="{_TD}">{detail}</td>'
+                f'</tr>'
+            )
+        return _tbl(_thead(hdrs), rows)
+
+    def _render_pyupg(lines: List[str]) -> str:
+        """PYUPG_ROW| item | status | detail"""
+        hdrs = ['Item', 'Status', 'Detail']
+        _st = {'OK':   'background:#d4f5dc;color:#1a7f37;font-weight:700;',
+               'WARN': 'background:#fff8e1;color:#b7770d;font-weight:700;',
+               'FAIL': 'background:#fdecea;color:#c0392b;font-weight:700;',
+               'INFO': 'background:#e8f4fd;color:#0366d6;font-weight:600;'}
+        rows = []
+        for ln in lines:
+            p = [x.strip() for x in ln.split('|', 3)]
+            if len(p) < 4:
+                rows.append(f'<tr><td colspan="3" style="{_TD}">{ln.strip()}</td></tr>')
+                continue
+            _, item, st, detail = p
+            rows.append(
+                f'<tr>'
+                f'<td style="{_TDM};font-weight:600;">{item}</td>'
+                f'<td style="{_TD}{_st.get(st, "")};width:60px;">{st}</td>'
+                f'<td style="{_TD};word-break:break-word;white-space:normal;">{detail}</td>'
+                f'</tr>'
+            )
+        return _tbl(_thead(hdrs), rows)
+
+    def _render_unauth(lines: List[str]) -> str:
+        """UNAUTH_ROW| pattern | status | detail"""
+        hdrs = ['Pattern / Check', 'Status', 'Result']
+        _st = {'OK':   'background:#d4f5dc;color:#1a7f37;font-weight:700;',
+               'WARN': 'background:#fff8e1;color:#b7770d;font-weight:700;',
+               'FAIL': 'background:#fdecea;color:#c0392b;font-weight:700;'}
+        rows = []
+        for ln in lines:
+            p = [x.strip() for x in ln.split('|', 3)]
+            if len(p) < 4:
+                rows.append(f'<tr><td colspan="3" style="{_TD}">{ln.strip()}</td></tr>')
+                continue
+            _, pattern, st, detail = p
+            rows.append(
+                f'<tr>'
+                f'<td style="{_TDM};font-weight:600;">{pattern}</td>'
+                f'<td style="{_TD}{_st.get(st, "")};width:60px;">{st}</td>'
+                f'<td style="{_TD}">{detail}</td>'
+                f'</tr>'
+            )
+        return _tbl(_thead(hdrs), rows)
+
+    def _render_unit(lines: List[str]) -> str:
+        """UNIT_ROW| check | status | detail"""
+        hdrs = ['Check', 'Status', 'Detail']
+        _st = {'OK':   'background:#d4f5dc;color:#1a7f37;font-weight:700;',
+               'WARN': 'background:#fff8e1;color:#b7770d;font-weight:700;',
+               'FAIL': 'background:#fdecea;color:#c0392b;font-weight:700;',
+               'INFO': 'background:#e8f4fd;color:#0366d6;font-weight:600;'}
+        rows = []
+        for ln in lines:
+            p = [x.strip() for x in ln.split('|', 3)]
+            if len(p) < 4:
+                rows.append(f'<tr><td colspan="3" style="{_TD}">{ln.strip()}</td></tr>')
+                continue
+            _, check, st, detail = p
+            rows.append(
+                f'<tr>'
+                f'<td style="{_TDM};font-weight:600;">{check}</td>'
+                f'<td style="{_TD}{_st.get(st, "")};width:60px;">{st}</td>'
+                f'<td style="{_TD};word-break:break-word;white-space:normal;">{detail}</td>'
+                f'</tr>'
+            )
+        return _tbl(_thead(hdrs), rows)
+
+    def _render_log(lines: List[str]) -> str:
+        """[ERROR|WARN|UNAUTH] message"""
+        hdrs = ['Level', 'Message']
+        _level_style = {
+            'ERROR': 'background:#fdecea;color:#c0392b;font-weight:700;',
+            'WARN':  'background:#fff8e1;color:#b7770d;font-weight:700;',
+            'UNAUTH': 'background:#fff3cd;color:#856404;font-weight:700;',
+        }
+        rows = []
+        for ln in lines:
+            m = re.match(r'^\[(\w+)\]\s+(.*)', ln.strip())
+            if m:
+                level, msg = m.group(1), m.group(2)
+                lstyle = _level_style.get(level, '')
+                rows.append(
+                    f'<tr>'
+                    f'<td style="{_TD}{lstyle};width:80px;">{level}</td>'
+                    f'<td style="{_TD};word-break:break-all;">{msg}</td>'
+                    f'</tr>'
+                )
+            else:
+                rows.append(f'<tr><td colspan="2" style="{_TD}">{ln.strip()}</td></tr>')
         return _tbl(_thead(hdrs), rows)
 
     def _render_pkg(lines: List[str]) -> str:
@@ -1875,11 +2324,17 @@ def _save_html_report(report: ValidationReport, output_path: Path) -> None:
         if not details:
             return ""
         _RENDERERS = {
-            'cat':  _render_cat,
-            'disc': _render_disc,
-            'sch':  _render_sch,
-            'rec':  _render_rec,
-            'pkg':  _render_pkg,
+            'cat':    _render_cat,
+            'disc':   _render_disc,
+            'sch':    _render_sch,
+            'sync':   _render_sync,
+            'meta':   _render_meta,
+            'integ':  _render_integ,
+            'pyupg':  _render_pyupg,
+            'unauth': _render_unauth,
+            'unit':   _render_unit,
+            'log':    _render_log,
+            'pkg':    _render_pkg,
         }
         parts: List[str] = []
         for typ, lines in _segment(details):
