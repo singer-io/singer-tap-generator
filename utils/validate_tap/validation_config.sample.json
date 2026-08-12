@@ -17,6 +17,7 @@
 
   "checks": [
     "python_upgrade",
+    "pylint",
     "metadata",
     "unauth_exclusion",
     "unit_tests",

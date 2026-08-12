@@ -496,11 +496,24 @@ def check_python_upgrade(tap_dir: Path) -> CheckResult:
             "install coverage":       bool(re.search(r"(?:pip|uv\s+pip)\s+install\b[^\n]*\bcoverage\b", ci_text)),
             "coverage run -m pytest": bool(re.search(r"coverage\s+run\b.*-m\s+pytest", ci_text)),
             "coverage html":          bool(re.search(r"coverage\s+html\b", ci_text)),
+            "coverage report step":   bool(re.search(r"coverage\s+report\b", ci_text)),
         }
         for label, ok in cov_checks.items():
             details.append(f"  PYUPG_ROW| CI coverage: {label} | {'OK' if ok else 'WARN'} | {'found in CI config' if ok else 'NOT FOUND in .circleci/config.yml'}")
             if not ok:
                 warnings.append(f"CircleCI: '{label}' not found in config")
+
+        # Coverage --fail-under threshold check
+        fu_m = re.search(r"coverage\s+report\b[^\n]*--fail-under[=\s](\d+)", ci_text)
+        if fu_m:
+            threshold = int(fu_m.group(1))
+            st = "OK" if threshold >= 80 else "WARN"
+            details.append(f"  PYUPG_ROW| CI coverage: --fail-under | {st} | threshold={threshold}%")
+            if threshold < 80:
+                warnings.append(f"CircleCI: coverage --fail-under={threshold} is below recommended 80%")
+        else:
+            details.append("  PYUPG_ROW| CI coverage: --fail-under | WARN | NOT SET in coverage report step")
+            warnings.append("CircleCI: coverage report missing --fail-under threshold")
 
     # setup.py / setup.cfg
     setup_text = _read_file(tap_dir / "setup.py") or _read_file(tap_dir / "setup.cfg") or ""
@@ -886,6 +899,184 @@ def check_integration_tests(tap_dir: Path) -> CheckResult:
     return CheckResult("integration_tests", "PASS",
                        f"Integration tests complete ({len(int_files)} files, {len(found)}/{len(expected)} types)",
                        details)
+
+
+
+# ===========================================================================
+# VALIDATOR 6 - Pylint code quality  (static)
+# ===========================================================================
+# Runs pylint on the tap package and surfaces:
+#   - Overall score
+#   - Error (E) and Fatal (F) messages → FAIL
+#   - Warning (W) and Refactor (R) messages → WARN
+#   - Convention (C) messages → INFO
+# pylint must be importable in the same Python that runs the validator.
+
+@register("pylint")
+def check_pylint(tap_dir: Path) -> CheckResult:
+    details:  List[str] = []
+    issues:   List[str] = []
+    warnings: List[str] = []
+
+    pkg_dir = _find_tap_package(tap_dir)
+    if not pkg_dir:
+        return CheckResult("pylint", "SKIP", "Tap package directory not found", [])
+
+    python = _find_python(tap_dir)
+
+    # Check pylint is available
+    probe = subprocess.run(
+        [python, "-m", "pylint", "--version"],
+        capture_output=True, text=True,
+    )
+    if probe.returncode != 0:
+        # Auto-install pylint into the same Python environment
+        details.append("  PYLINT_ROW| pylint available | WARN | not found — installing now...")
+        install = subprocess.run(
+            [python, "-m", "pip", "install", "--quiet", "pylint"],
+            capture_output=True, text=True,
+        )
+        if install.returncode != 0:
+            return CheckResult(
+                "pylint", "SKIP",
+                "pylint not installed and auto-install failed",
+                details + [f"  PYLINT_ROW| pip install pylint | FAIL | {install.stderr[:300]}"],
+            )
+        # Re-probe after install
+        probe = subprocess.run(
+            [python, "-m", "pylint", "--version"],
+            capture_output=True, text=True,
+        )
+        if probe.returncode != 0:
+            return CheckResult(
+                "pylint", "SKIP",
+                "pylint installed but still not importable — check environment",
+                details + ["  PYLINT_ROW| pylint available | FAIL | installed but not found after install"],
+            )
+        details.append("  PYLINT_ROW| pylint install | INFO | installed successfully")
+
+    pylint_ver = (probe.stdout or probe.stderr).splitlines()[0].strip()
+    details.append(f"  PYLINT_ROW| pylint version | INFO | {pylint_ver}")
+    details.append(f"  PYLINT_ROW| target package | INFO | {pkg_dir.name}/")
+
+    # Run pylint with structured message format
+    # --score=y gives the final score line; --output-format=text gives parseable output
+    result = subprocess.run(
+        [
+            python, "-m", "pylint",
+            str(pkg_dir),
+            "--output-format=text",
+            "--score=y",
+            "--msg-template={path}:{line}: [{msg_id}({symbol})] {msg}",
+            "--disable=C0114,C0115,C0116",   # skip missing-docstring noise
+            "--disable=R0801",                # skip duplicate-code (slow + noisy)
+            "--disable=W0511",                # skip fixme/todo notes
+            "--disable=E0401"                 # skip import-error (may be false positive in venv)
+        ],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    # pylint exits 0 = no issues, 1-31 = bitmask of issue categories found
+    # exit 32 = usage error — treat as skip
+    if result.returncode == 32:
+        return CheckResult("pylint", "SKIP",
+                           "pylint usage error — check tap package path",
+                           details + [f"  PYLINT_ROW| error | SKIP | {result.stderr[:200]}"])
+
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+
+    # Parse score line: "Your code has been rated at X.XX/10"
+    score_line = next((l for l in stdout.splitlines() if "rated at" in l), "")
+    score_val: Optional[float] = None
+    sm = re.search(r'rated at ([\-\d.]+)/10', score_line)
+    if sm:
+        score_val = float(sm.group(1))
+        score_st  = "OK" if score_val >= 8.0 else ("WARN" if score_val >= 6.0 else "FAIL")
+        details.append(f"  PYLINT_ROW| pylint score | {score_st} | {score_val:.2f}/10")
+        if score_val < 6.0:
+            issues.append(f"pylint score too low: {score_val:.2f}/10 (threshold: 6.0)")
+        elif score_val < 8.0:
+            warnings.append(f"pylint score below recommended: {score_val:.2f}/10 (recommended: 8.0)")
+
+    # Parse individual messages
+    counts: Dict[str, int] = {'E': 0, 'F': 0, 'W': 0, 'R': 0, 'C': 0}
+    # Emit at most 30 lines per category to keep report readable
+    _MAX_PER_CAT = 30
+    _cat_seen:   Dict[str, int] = {'E': 0, 'F': 0, 'W': 0, 'R': 0, 'C': 0}
+    _msg_re = re.compile(r'^(.+):(\d+):\s*\[([EFWRC]\d+)\(([^)]+)\)\]\s*(.*)')
+
+    for line in stdout.splitlines():
+        m = _msg_re.match(line.strip())
+        if not m:
+            continue
+        fpath, lineno, msg_id, symbol, msg = (
+            m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+        )
+        cat = msg_id[0]  # E / F / W / R / C
+        counts[cat] = counts.get(cat, 0) + 1
+
+        if _cat_seen.get(cat, 0) >= _MAX_PER_CAT:
+            continue
+        _cat_seen[cat] = _cat_seen.get(cat, 0) + 1
+
+        # Short relative path
+        try:
+            rel = Path(fpath).relative_to(tap_dir)
+        except ValueError:
+            rel = Path(fpath).name  # type: ignore[assignment]
+
+        st = "FAIL" if cat in ('E', 'F') else ("WARN" if cat in ('W', 'R') else "INFO")
+        details.append(
+            f"  PYLINT_ROW| {rel}:{lineno} | {st} | [{msg_id}({symbol})] {msg}"
+        )
+
+    # Truncation notice
+    for cat, total in counts.items():
+        if total > _MAX_PER_CAT:
+            st = "FAIL" if cat in ('E', 'F') else ("WARN" if cat in ('W', 'R') else "INFO")
+            details.append(
+                f"  PYLINT_ROW| ... {cat} messages | {st} | "
+                f"showing {_MAX_PER_CAT} of {total} — see full output in pylint_output.txt"
+            )
+
+    # Write full pylint output to artifact file
+    out_dir: Path = _RUNTIME.get("output_dir") or (tap_dir / "validator_output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    artifact = out_dir / "pylint_output.txt"
+    artifact.write_text(stdout + ("\n--- stderr ---\n" + stderr if stderr.strip() else ""),
+                        encoding="utf-8")
+    details.append(f"  PYLINT_ROW| artifact | INFO | {artifact}")
+
+    # Summary counts
+    e_total = counts['E'] + counts['F']
+    w_total = counts['W'] + counts['R']
+    c_total = counts['C']
+    details.append(
+        f"  PYLINT_ROW| summary | INFO | "
+        f"errors={e_total}  warnings={w_total}  convention={c_total}"
+    )
+
+    if e_total > 0:
+        issues.append(f"pylint: {e_total} error(s)/fatal(s)")
+    if w_total > 0:
+        warnings.append(f"pylint: {w_total} warning(s)/refactor(s)")
+
+    if issues:
+        return CheckResult("pylint", "FAIL",
+                           f"Pylint FAILED: {'; '.join(issues)}", details)
+    if warnings:
+        return CheckResult("pylint", "WARN",
+                           f"Pylint warnings: {'; '.join(warnings)}"
+                           + (f" | score {score_val:.2f}/10" if score_val is not None else ""),
+                           details)
+    return CheckResult(
+        "pylint", "PASS",
+        f"Pylint clean — score {score_val:.2f}/10, "
+        f"errors=0, warnings={w_total}, convention={c_total}"
+        if score_val is not None else "Pylint clean (no errors/warnings)",
+        details,
+    )
 
 
 # ===========================================================================
@@ -1534,11 +1725,15 @@ def check_schema(tap_dir: Path) -> CheckResult:
         if not props:
             fw.append("no properties defined")
 
-        non_null, dt_missing = [], []
+        non_null, dt_missing, no_type = [], [], []
         for pname, pdef in props.items():
             if not isinstance(pdef, dict):
                 continue
             ptype = pdef.get("type", [])
+            # No 'type' key at all, or type is empty → undefined field
+            if not ptype and "properties" not in pdef and "anyOf" not in pdef and "$ref" not in pdef:
+                no_type.append(pname)
+                continue
             if isinstance(ptype, str):
                 ptype = [ptype]
             if ptype and "null" not in ptype:
@@ -1554,6 +1749,8 @@ def check_schema(tap_dir: Path) -> CheckResult:
         fi.extend(sch_issues)
         fw.extend(sch_warns)
 
+        if no_type:
+            fi.append(f"{len(no_type)} field(s) with no type defined: {', '.join(no_type[:10])}{'...' if len(no_type) > 10 else ''}")
         if non_null:
             fw.append(f"{len(non_null)} non-nullable: {', '.join(non_null[:5])}")
         if dt_missing:
@@ -1566,10 +1763,13 @@ def check_schema(tap_dir: Path) -> CheckResult:
         details.append(
             f"  {name}.json [{status}]"
             f"  props={len(props)}"
+            f"  no-type={len(no_type)}"
             f"  non-nullable={len(non_null)}"
             f"  dt-format-issues={len(dt_missing)}"
         )
         # Structured sub-lines picked up by HTML renderer
+        if no_type:
+            details.append(f"  SCHEMA_FIELD| {name}.json | no-type | {', '.join(no_type)}")
         if non_null:
             details.append(f"  SCHEMA_FIELD| {name}.json | non-nullable | {', '.join(non_null)}")
         if dt_missing:
@@ -1584,7 +1784,7 @@ def check_schema(tap_dir: Path) -> CheckResult:
 
     if issues:
         return CheckResult("schema", "FAIL",
-                           f"Schema FAILED: {len(issues)} issue(s) in {s_issues} file(s)", details)
+                           f"Schema FAILED: {len(issues)} issue(s) in {s_issues} file(s) (check no-type fields, root type)", details)
     if warnings:
         return CheckResult("schema", "WARN",
                            f"Schema warnings: {len(warnings)} warning(s) across {s_warns} file(s)", details)
@@ -2097,6 +2297,7 @@ def _save_html_report(report: ValidationReport, output_path: Path) -> None:
     _RE_UNIT      = re.compile(r'^UNIT_ROW\|')                    # unit test row
     _RE_DISC_I    = re.compile(r'^DISC_INFO\|')                   # discovery info row
     _RE_SYNC_I    = re.compile(r'^SYNC_INFO\|')                   # sync info row
+    _RE_PYLINT    = re.compile(r'^PYLINT_ROW\|')                  # pylint message row
     _RE_LOG       = re.compile(r'^\[(ERROR|WARN|UNAUTH)\]\s+')    # discovery/sync log line
     _RE_PKG       = re.compile(r'^[\w][\w.-]+==[^\s:]+:')         # package pin
 
@@ -2115,6 +2316,7 @@ def _save_html_report(report: ValidationReport, output_path: Path) -> None:
         if _RE_PYUPG.match(s):     return 'pyupg'
         if _RE_UNAUTH_R.match(s):  return 'unauth'
         if _RE_UNIT.match(s):      return 'unit'
+        if _RE_PYLINT.match(s):    return 'pylint'
         if _RE_LOG.match(s):       return 'log'
         if _RE_PKG.match(s):       return 'pkg'
         return None
@@ -2201,7 +2403,7 @@ def _save_html_report(report: ValidationReport, output_path: Path) -> None:
 
     def _render_sch(lines: List[str]) -> str:
         """Render schema file summary rows and SCHEMA_FIELD sub-detail rows."""
-        hdrs = ['File', 'Status', 'Props', 'Non-Nullable', 'DT Format Issues', 'Issue Type', 'Affected Fields']
+        hdrs = ['File', 'Status', 'Props', 'No-Type', 'Non-Nullable', 'DT Format Issues', 'Issue Type', 'Affected Fields']
         rows = []
         for ln in lines:
             s = ln.strip()
@@ -2210,7 +2412,7 @@ def _save_html_report(report: ValidationReport, output_path: Path) -> None:
                 msg = s[len('SCH_INFO|'):].strip()
                 rows.append(
                     f'<tr>'
-                    f'<td colspan="7" style="{_TD}background:#f7f7f7;color:#444;font-style:italic;">'
+                    f'<td colspan="8" style="{_TD}background:#f7f7f7;color:#444;font-style:italic;">'
                     f'{msg}</td></tr>'
                 )
                 continue
@@ -2219,28 +2421,30 @@ def _save_html_report(report: ValidationReport, output_path: Path) -> None:
             if mf:
                 _fname, _itype, _fields = mf.group(1).strip(), mf.group(2).strip(), mf.group(3).strip()
                 _itype_label = {
-                    'non-nullable': 'Non-Nullable',
+                    'non-nullable':             'Non-Nullable',
                     'missing-date-time-format': 'Missing date-time format',
-                    'error': 'Error',
+                    'no-type':                  'No type defined',
+                    'error':                    'Error',
                 }.get(_itype, _itype)
                 _itype_style = (
-                    'background:#fff8e1;color:#b7770d;font-weight:600;' if _itype == 'non-nullable'
-                    else 'background:#fdecea;color:#c0392b;font-weight:600;' if _itype in ('error', 'missing-date-time-format')
+                    'background:#fdecea;color:#c0392b;font-weight:600;' if _itype in ('error', 'no-type')
+                    else 'background:#fdecea;color:#c0392b;font-weight:600;' if _itype == 'missing-date-time-format'
+                    else 'background:#fff8e1;color:#b7770d;font-weight:600;' if _itype == 'non-nullable'
                     else ''
                 )
                 rows.append(
                     f'<tr style="font-size:0.78rem;">'
                     f'<td style="{_TDM};color:#888;padding-left:24px;">{_fname}</td>'
-                    f'<td colspan="4" style="{_TD}"></td>'
+                    f'<td colspan="5" style="{_TD}"></td>'
                     f'<td style="{_TD};width:160px;{_itype_style}">{_itype_label}</td>'
                     f'<td style="{_TDM};word-break:break-word;white-space:normal;">{_fields}</td>'
                     f'</tr>'
                 )
                 continue
-            # Summary row  (orders.json [OK]  props=N  non-nullable=N  dt-format-issues=N)
+            # Summary row  (orders.json [OK]  props=N  no-type=N  non-nullable=N  dt-format-issues=N)
             m = re.match(r'^(\S+\.json)\s+\[(OK|WARN|FAIL)\](.*)', s)
             if not m:
-                rows.append(f'<tr><td colspan="7" style="{_TD}">{s}</td></tr>')
+                rows.append(f'<tr><td colspan="8" style="{_TD}">{s}</td></tr>')
                 continue
             fname, st, rest = m.group(1), m.group(2), m.group(3)
             kv: Dict[str, str] = {}
@@ -2252,6 +2456,7 @@ def _save_html_report(report: ValidationReport, output_path: Path) -> None:
                 f'<td style="{_TDM}"><strong>{fname}</strong></td>'
                 f'<td style="{_TD}{_ST.get(st, "")}">{st}</td>'
                 f'<td style="{_TD};text-align:right;">{kv.get("props", "-")}</td>'
+                f'<td style="{_TD};text-align:right;{"color:#c0392b;font-weight:700;" if kv.get("no-type","0") not in ("0","-","") else ""}">{kv.get("no-type", "-")}</td>'
                 f'<td style="{_TD};text-align:right;">{kv.get("non-nullable", "-")}</td>'
                 f'<td style="{_TD};text-align:right;">{kv.get("dt-format-issues", "-")}</td>'
                 f'<td style="{_TD}">-</td>'
@@ -2452,6 +2657,30 @@ def _save_html_report(report: ValidationReport, output_path: Path) -> None:
             )
         return _tbl(_thead(hdrs), rows)
 
+    def _render_pylint(lines: List[str]) -> str:
+        """PYLINT_ROW| file:line | status | [msg_id(symbol)] message"""
+        hdrs = ['Location', 'Severity', 'Message']
+        _st = {'OK':   'background:#d4f5dc;color:#1a7f37;font-weight:700;',
+               'WARN': 'background:#fff8e1;color:#b7770d;font-weight:700;',
+               'FAIL': 'background:#fdecea;color:#c0392b;font-weight:700;',
+               'SKIP': 'background:#f0f0f0;color:#555;font-weight:600;',
+               'INFO': 'background:#e8f4fd;color:#0366d6;font-weight:600;'}
+        rows = []
+        for ln in lines:
+            p = [x.strip() for x in ln.split('|', 3)]
+            if len(p) < 4:
+                rows.append(f'<tr><td colspan="3" style="{_TD}">{ln.strip()}</td></tr>')
+                continue
+            _, loc, st, msg = p
+            rows.append(
+                f'<tr>'
+                f'<td style="{_TDM};font-size:0.76rem;">{loc}</td>'
+                f'<td style="{_TD}{_st.get(st, "")};width:60px;">{st}</td>'
+                f'<td style="{_TD};word-break:break-word;white-space:normal;">{msg}</td>'
+                f'</tr>'
+            )
+        return _tbl(_thead(hdrs), rows)
+
     def _render_log(lines: List[str]) -> str:
         """[ERROR|WARN|UNAUTH] message"""
         hdrs = ['Level', 'Message']
@@ -2511,6 +2740,7 @@ def _save_html_report(report: ValidationReport, output_path: Path) -> None:
             'pyupg':  _render_pyupg,
             'unauth': _render_unauth,
             'unit':   _render_unit,
+            'pylint': _render_pylint,
             'log':    _render_log,
             'pkg':    _render_pkg,
         }
