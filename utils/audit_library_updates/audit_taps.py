@@ -85,6 +85,27 @@ default ``tmp/configs/config.json``), ``--log-file`` (default
 consolidated file across the whole execution - in addition to the console),
 ``--verbose`` (debug logging).
 
+OPTIONAL QTC STATUS ENRICHMENT
+------------------------------
+If ``qtc_status.xlsx`` is present in the same directory as this script, it is
+automatically loaded and a ``QTC Status`` column is added to every generated
+report sheet (``Dependency Audit`` and ``Summary``). The value is matched by
+the tap name in ``TAP_NAME`` and taken from ``release_ff``.
+
+The file is optional: if it is not present, the report is generated exactly as
+before. The first worksheet must contain these columns (column order does not
+matter)::
+
+    TAP_NAME                 release_ff
+    tap-shopify              QCDI_STITCH_INTEGRATION
+    tap-gitlab               QTCP_STITCH_CONN_BATCH_14
+    tap-mailjet              QTCP_STITCH_CONN_BATCH_17
+
+``TAP_NAME`` must contain the exact Singer tap repository name used by the
+report. Duplicate ``TAP_NAME`` values are rejected to avoid ambiguous status
+mapping. Taps that are not present in the QTC file receive a blank ``QTC
+Status`` value. Extra columns in the QTC workbook are ignored.
+
 VIRTUAL ENVIRONMENT
 ---------------------
 On every invocation, the script checks for a ``.venv`` folder next to this
@@ -328,6 +349,14 @@ SUMMARY_COLUMNS = [
     "Libraries Requiring Updates",
     "Overall Status",
 ]
+
+# Optional QTC status enrichment. When qtc_status.xlsx exists next to this
+# script, its TAP_NAME -> release_ff mapping is added to every generated
+# report sheet.
+DEFAULT_QTC_STATUS_FILE = "qtc_status.xlsx"
+QTC_TAP_NAME_COLUMN = "TAP_NAME"
+QTC_STATUS_SOURCE_COLUMN = "release_ff"
+QTC_STATUS_REPORT_COLUMN = "QTC Status"
 
 # Fallback stdlib module list used on Python < 3.10 where
 # sys.stdlib_module_names does not exist.
@@ -1204,16 +1233,72 @@ def build_summaries(rows: List[ReportRow]) -> List[TapSummary]:
     return summaries
 
 
-def write_report(rows: List[ReportRow], output_path: str) -> None:
+def _load_qtc_status(qtc_status_path: Optional[Path]) -> Optional[Dict[str, str]]:
+    """Load optional TAP_NAME -> release_ff QTC status mapping."""
+    if qtc_status_path is None or not qtc_status_path.exists():
+        return None
+    if not HAVE_OPENPYXL:
+        raise RuntimeError(f"{qtc_status_path} was found, but openpyxl is required to read it.")
+
+    try:
+        wb = openpyxl.load_workbook(qtc_status_path, read_only=True, data_only=True)
+    except Exception as exc:
+        raise RuntimeError(f"Could not read QTC status file {qtc_status_path}: {exc}") from exc
+
+    try:
+        if not wb.sheetnames:
+            raise ValueError("workbook contains no worksheets")
+        ws = wb[wb.sheetnames[0]]
+        rows_iter = ws.iter_rows(values_only=True)
+        try:
+            header_row = next(rows_iter)
+        except StopIteration as exc:
+            raise ValueError("workbook is empty") from exc
+
+        headers = {str(value).strip().lower(): index for index, value in enumerate(header_row) if value is not None}
+        tap_col = headers.get(QTC_TAP_NAME_COLUMN.lower())
+        status_col = headers.get(QTC_STATUS_SOURCE_COLUMN.lower())
+        if tap_col is None or status_col is None:
+            raise ValueError(
+                f"expected columns '{QTC_TAP_NAME_COLUMN}' and '{QTC_STATUS_SOURCE_COLUMN}' in the first worksheet"
+            )
+
+        mapping: Dict[str, str] = {}
+        duplicate_taps = set()
+        for row in rows_iter:
+            if tap_col >= len(row) or row[tap_col] is None or not str(row[tap_col]).strip():
+                continue
+            tap_name = str(row[tap_col]).strip()
+            status = str(row[status_col]).strip() if status_col < len(row) and row[status_col] is not None else ""
+            if tap_name in mapping:
+                duplicate_taps.add(tap_name)
+            mapping[tap_name] = status
+
+        if duplicate_taps:
+            sample = ", ".join(sorted(duplicate_taps)[:10])
+            suffix = " ..." if len(duplicate_taps) > 10 else ""
+            raise ValueError(f"duplicate TAP_NAME values found: {sample}{suffix}")
+
+        LOGGER.info("Loaded QTC status mapping from %s: %d tap(s)", qtc_status_path, len(mapping))
+        return mapping
+    finally:
+        wb.close()
+
+
+def write_report(
+    rows: List[ReportRow],
+    output_path: str,
+    qtc_status_path: Optional[Path] = None,
+) -> None:
     sorted_rows = sort_report_rows(rows)
     summaries = build_summaries(rows)
 
     if HAVE_OPENPYXL and output_path.lower().endswith(".xlsx"):
-        _write_xlsx(sorted_rows, summaries, output_path)
+        _write_xlsx(sorted_rows, summaries, output_path, qtc_status_path=qtc_status_path)
     else:
         if output_path.lower().endswith(".xlsx") and not HAVE_OPENPYXL:
             LOGGER.warning("openpyxl is not installed; writing CSV files instead of .xlsx")
-        _write_csv(sorted_rows, summaries, output_path)
+        _write_csv(sorted_rows, summaries, output_path, qtc_status_path=qtc_status_path)
 
 
 # Leading characters that Excel/other spreadsheet apps may misinterpret as the
@@ -1228,7 +1313,15 @@ def _spreadsheet_safe(value):
     return value
 
 
-def _write_csv(rows: List[ReportRow], summaries: List[TapSummary], output_path: str) -> None:
+def _write_csv(
+    rows: List[ReportRow],
+    summaries: List[TapSummary],
+    output_path: str,
+    qtc_status_path: Optional[Path] = None,
+) -> None:
+    qtc_status = _load_qtc_status(qtc_status_path)
+    report_columns = REPORT_COLUMNS + ([QTC_STATUS_REPORT_COLUMN] if qtc_status is not None else [])
+    summary_columns = SUMMARY_COLUMNS + ([QTC_STATUS_REPORT_COLUMN] if qtc_status is not None else [])
     base = output_path
     if base.lower().endswith(".xlsx"):
         base = base[: -len(".xlsx")] + ".csv"
@@ -1237,7 +1330,7 @@ def _write_csv(rows: List[ReportRow], summaries: List[TapSummary], output_path: 
 
     with open(base, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(REPORT_COLUMNS)
+        writer.writerow(report_columns)
         for row in rows:
             writer.writerow(
                 [
@@ -1246,6 +1339,7 @@ def _write_csv(rows: List[ReportRow], summaries: List[TapSummary], output_path: 
                         row.installed_version, row.latest_version, row.needs_update,
                         row.update_available, row.version_change_type, row.status, row.notes,
                     )
+                    + ((qtc_status.get(row.tap_name, ""),) if qtc_status is not None else ())
                 ]
             )
     LOGGER.info("Wrote detail report to %s", base)
@@ -1253,7 +1347,7 @@ def _write_csv(rows: List[ReportRow], summaries: List[TapSummary], output_path: 
     summary_path = base[: -len(".csv")] + ".summary.csv"
     with open(summary_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(SUMMARY_COLUMNS)
+        writer.writerow(summary_columns)
         for s in summaries:
             writer.writerow(
                 [
@@ -1261,6 +1355,7 @@ def _write_csv(rows: List[ReportRow], summaries: List[TapSummary], output_path: 
                         s.tap_name, s.total, s.main_count, s.dev_count, s.needing_update,
                         s.up_to_date, s.overall_change_type, s.libraries_requiring_updates, s.overall_status,
                     )
+                    + ((qtc_status.get(s.tap_name, ""),) if qtc_status is not None else ())
                 ]
             )
     LOGGER.info("Wrote summary report to %s", summary_path)
@@ -1311,7 +1406,15 @@ def _save_workbook_atomically(wb, output_path: str, attempts: int = 5) -> None:
     raise last_exc
 
 
-def _write_xlsx(rows: List[ReportRow], summaries: List[TapSummary], output_path: str) -> None:
+def _write_xlsx(
+    rows: List[ReportRow],
+    summaries: List[TapSummary],
+    output_path: str,
+    qtc_status_path: Optional[Path] = None,
+) -> None:
+    qtc_status = _load_qtc_status(qtc_status_path)
+    report_columns = REPORT_COLUMNS + ([QTC_STATUS_REPORT_COLUMN] if qtc_status is not None else [])
+    summary_columns = SUMMARY_COLUMNS + ([QTC_STATUS_REPORT_COLUMN] if qtc_status is not None else [])
     wb = openpyxl.Workbook()
 
     version_cols = {
@@ -1321,7 +1424,7 @@ def _write_xlsx(rows: List[ReportRow], summaries: List[TapSummary], output_path:
 
     detail_ws = wb.active
     detail_ws.title = "Dependency Audit"
-    detail_ws.append(REPORT_COLUMNS)
+    detail_ws.append(report_columns)
     for row in rows:
         detail_ws.append(
             [
@@ -1330,6 +1433,7 @@ def _write_xlsx(rows: List[ReportRow], summaries: List[TapSummary], output_path:
                     row.installed_version, row.latest_version, row.needs_update,
                     row.update_available, row.version_change_type, row.status, row.notes,
                 )
+                + ((qtc_status.get(row.tap_name, ""),) if qtc_status is not None else ())
             ]
         )
         status_col = REPORT_COLUMNS.index("Status") + 1
@@ -1337,7 +1441,7 @@ def _write_xlsx(rows: List[ReportRow], summaries: List[TapSummary], output_path:
         cell = detail_ws.cell(row=detail_ws.max_row, column=status_col)
         if fill_color:
             cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
-        for col in range(1, len(REPORT_COLUMNS) + 1):
+        for col in range(1, len(report_columns) + 1):
             data_cell = detail_ws.cell(row=detail_ws.max_row, column=col)
             data_cell.alignment = Alignment(vertical="top", wrap_text=True)
             if col in version_cols:
@@ -1346,12 +1450,14 @@ def _write_xlsx(rows: List[ReportRow], summaries: List[TapSummary], output_path:
                 data_cell.number_format = "@"
 
     column_widths = [22, 40, 20, 28, 26, 20, 13, 16, 18, 18, 45]
+    if qtc_status is not None:
+        column_widths.append(30)
     for i, width in enumerate(column_widths, start=1):
         detail_ws.column_dimensions[get_column_letter(i)].width = width
-    _style_header(detail_ws, len(REPORT_COLUMNS))
+    _style_header(detail_ws, len(report_columns))
 
     summary_ws = wb.create_sheet("Summary")
-    summary_ws.append(SUMMARY_COLUMNS)
+    summary_ws.append(summary_columns)
     for s in summaries:
         summary_ws.append(
             [
@@ -1359,6 +1465,7 @@ def _write_xlsx(rows: List[ReportRow], summaries: List[TapSummary], output_path:
                     s.tap_name, s.total, s.main_count, s.dev_count, s.needing_update,
                     s.up_to_date, s.overall_change_type, s.libraries_requiring_updates, s.overall_status,
                 )
+                + ((qtc_status.get(s.tap_name, ""),) if qtc_status is not None else ())
             ]
         )
         status_col = SUMMARY_COLUMNS.index("Overall Status") + 1
@@ -1366,15 +1473,17 @@ def _write_xlsx(rows: List[ReportRow], summaries: List[TapSummary], output_path:
         cell = summary_ws.cell(row=summary_ws.max_row, column=status_col)
         if fill_color:
             cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
-        for col in range(1, len(SUMMARY_COLUMNS) + 1):
+        for col in range(1, len(summary_columns) + 1):
             summary_ws.cell(row=summary_ws.max_row, column=col).alignment = Alignment(
                 vertical="top", wrap_text=True
             )
 
     summary_widths = [26, 18, 18, 16, 18, 14, 20, 55, 18]
+    if qtc_status is not None:
+        summary_widths.append(30)
     for i, width in enumerate(summary_widths, start=1):
         summary_ws.column_dimensions[get_column_letter(i)].width = width
-    _style_header(summary_ws, len(SUMMARY_COLUMNS))
+    _style_header(summary_ws, len(summary_columns))
 
     _save_workbook_atomically(wb, output_path)
     LOGGER.info("Wrote Excel report to %s", output_path)
@@ -2133,6 +2242,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     workdir = Path(args.workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
 
+    # Optional QTC enrichment file. Resolve relative to the script so the
+    # behavior is independent of the directory from which the script is run.
+    qtc_status_path = Path(__file__).resolve().parent / DEFAULT_QTC_STATUS_FILE
+    if qtc_status_path.exists():
+        LOGGER.info("QTC status enrichment enabled: %s", qtc_status_path)
+    else:
+        qtc_status_path = None
+
     gh_client = GitHubClient(token)
     pypi_client = PyPIClient()
 
@@ -2160,7 +2277,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if tap_names is None:
             return 1
         rows = run_audit(tap_names, args.org, workdir, pypi_client, shallow=True)
-        write_report(rows, args.output)
+        write_report(rows, args.output, qtc_status_path=qtc_status_path)
         taps_needing_update = sorted({r.tap_name for r in rows if r.needs_update == "Yes"})
         if not taps_needing_update:
             LOGGER.info("No taps require dependency updates; nothing to do for --create-pr-all")
@@ -2177,7 +2294,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     rows = run_audit(tap_names, args.org, workdir, pypi_client, shallow=True)
-    write_report(rows, args.output)
+    write_report(rows, args.output, qtc_status_path=qtc_status_path)
 
     needing_update = len({r.tap_name for r in rows if r.needs_update == "Yes"})
     LOGGER.info(
