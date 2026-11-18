@@ -1,0 +1,8 @@
+# Development / test tooling only.
+# The benchmark framework itself uses ONLY the Python standard library - nothing here is needed to run benchmarks.
+# (The tap repositories keep their own dependencies in their own virtualenvs.)
+#
+# Versions this was developed and tested with (Python 3.12.9): pytest 8.4.1, requests 2.34.2, pylint 4.0.4
+pytest
+requests      # used by the fake tap in tests/ (the real taps bring their own copy inside their venvs)
+pylint        # optional: lint the framework (python -m pylint *.py --disable=C,R --max-line-length=130)

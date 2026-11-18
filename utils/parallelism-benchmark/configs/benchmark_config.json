@@ -1,0 +1,35 @@
+{
+  "_comment": "Central benchmark configuration. Command-line arguments override these values (see README, section 5). Keys starting with '_' are ignored.",
+  "workers": [1, 2, 3, 4],
+  "enabled_taps": [
+    "tap-jira",
+    "tap-oracle-fusion",
+    "tap-sap-success-factor",
+    "tap-activecampaign"
+  ],
+  "timeout_seconds": 1800,
+  "stream_timeout_seconds": 1800,
+  "continue_on_stream_failure": true,
+  "stop_on_unstable_run": false,
+  "merge_output": true,
+  "keep_unit_outputs": false,
+  "native_baseline": false,
+  "log_level": "INFO",
+  "default_record_limit": null,
+  "tap_record_limits": {
+    "tap-oracle-fusion": 500,
+    "tap-activecampaign": 500
+  },
+  "stream_record_limits": {
+    "tap-jira": {
+      "issues": 1000
+    },
+    "tap-activecampaign": {
+      "contacts": 500
+    }
+  },
+  "max_429_ratio": 0.10,
+  "record_tolerance_pct": 2.0,
+  "recommendation_min_speedup": 1.2,
+  "schedule_order": "catalog"
+}

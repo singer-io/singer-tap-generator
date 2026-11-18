@@ -1,0 +1,117 @@
+{
+  "_comment": "Centralised tap registry. A relative repo_path is resolved against the workspace root (the folder that contains parallelism-benchmark/); every other path is relative to the tap repository. Existing tap files are only ever READ.",
+  "taps": {
+    "tap-jira": {
+      "repo_path": "tap-jira",
+      "enabled": true,
+      "adapter": "process_isolation",
+      "config_path": "tmp/configs/config.json",
+      "discovery_command_path": "tmp/commands/discovery_run_command.txt",
+      "sync_command_path": "tmp/commands/sync_run_command.txt",
+      "catalog_path": "tmp/catalogs/catalog.json",
+      "output_path": "tmp/outputs/output.json",
+      "add_selected_script": "tmp/scripts/add_selected.py",
+      "extra_secret_files": ["tmp/configs/config_jira.json"],
+      "required_config_keys": ["start_date"],
+      "catalog_strategy": "preserve_existing",
+      "streams_per_task": 1,
+      "rate_limit_info": "UNKNOWN",
+      "isolation_findings": [
+        "tap_jira.context.Context is a class-level singleton (config, state, catalog, client): in-process threading would share it, so it was rejected.",
+        "One Client owns a single requests.Session and a request-spacing timer; every worker process builds its own.",
+        "Child streams are written by their parent (projects -> versions, components; issues -> issue_comments, changelogs, issue_transitions; groups -> group_users) and tap_jira.streams.validate_dependencies() requires the parent to be selected, so each family is one work unit.",
+        "HTTP 429 is mapped to JiraRateLimitError (tap_jira/http.py ERROR_CODE_EXCEPTION_MAPPING); connection/5xx errors are retried with backoff (max_tries=6)."
+      ],
+      "notes": "Child streams are emitted by their parent stream, so each parent family is one work unit."
+    },
+    "tap-oracle-fusion": {
+      "repo_path": "tap-oracle-fusion",
+      "enabled": true,
+      "adapter": "process_isolation",
+      "config_path": "tmp/configs/config.json",
+      "discovery_command_path": "tmp/commands/discovery_run_command.txt",
+      "sync_command_path": "tmp/commands/sync_run_command.txt",
+      "catalog_path": "tmp/catalogs/catalog.json",
+      "output_path": "tmp/outputs/output.json",
+      "add_selected_script": "tmp/scripts/add_selected.py",
+      "extra_secret_files": ["tmp/configs/config_jira.json"],
+      "required_config_keys": ["base_url", "username", "password", "start_date"],
+      "catalog_strategy": "preserve_existing",
+      "config_overrides": {"bicc_force_full_sync": true},
+      "streams_per_task": 1,
+      "rate_limit_info": "UNKNOWN",
+      "isolation_findings": [
+        "tap_oracle_fusion.sync.sync() is one loop over catalog.get_selected_streams() sharing a single OracleClient (requests.Session), one BICCExtractClient and one state dict; all records go to one stdout.",
+        "Every selected stream is a BICC datastore extract (path biacm/rest/meta/datastores/...): an ESS job is created/reused per datastore, polled, and the extract file is downloaded before rows are yielded, so a record limit shortens only the post-download processing, not the server-side extraction.",
+        "BICC jobs are reused on the server between runs; the benchmark therefore sets bicc_force_full_sync=true in a temporary copy of the config so each run performs a full extract."
+      ],
+      "notes": "The existing catalog is the source of truth: its selected/unselected flags are preserved and only streams selected there are benchmarked; excluded streams are reported but never run."
+    },
+    "tap-sap-success-factors": {
+      "repo_path": "tap-sap-success-factors",
+      "aliases": ["tap-sap-success-factor"],
+      "enabled": true,
+      "adapter": "process_isolation",
+      "config_path": "tmp/configs/config.json",
+      "discovery_command_path": "tmp/commands/discovery_run_command.txt",
+      "sync_command_path": "tmp/commands/sync_run_command.txt",
+      "catalog_path": "tmp/catalogs/catalog.json",
+      "output_path": "tmp/outputs/output.json",
+      "add_selected_script": "tmp/scripts/add_selected.py",
+      "extra_secret_files": ["tmp/configs/config_jira.json"],
+      "required_config_keys": ["api_server", "start_date"],
+      "catalog_strategy": "preserve_existing",
+      "streams_per_task": 10,
+      "rate_limit_info": "UNKNOWN",
+      "isolation_findings": [
+        "tap_sap_success_factors.sync.sync() is one loop over catalog.get_selected_streams() sharing a single SAPSuccessFactorsClient (session + OAuth token) and one state dict.",
+        "Child streams (parent-tap-stream-id metadata) are synced through their parent and an unselected parent is synced just to reach a selected child, so each parent family is one work unit.",
+        "OAuth is performed per process (token request per worker process); the 429 handler waits for Retry-After (backoff.runtime, max_tries=5)."
+      ],
+      "notes": "Each stream needs ~2-3s of process start + OAuth, so unlimited stream families are batched 10 per process (streams_per_task=10); a batch runs its streams one after another, so N workers = at most N streams in flight. Streams that have a record limit always get their own process."
+    },
+    "tap-activecampaign": {
+      "repo_path": "tap-activecampaign",
+      "enabled": true,
+      "adapter": "process_isolation",
+      "config_path": "tmp/configs/config.json",
+      "discovery_command_path": "tmp/commands/discovery_run_command.txt",
+      "sync_command_path": "tmp/commands/sync_run_command.txt",
+      "catalog_path": "tmp/catalogs/catalog.json",
+      "output_path": "tmp/outputs/output.json",
+      "add_selected_script": "tmp/scripts/add_selected.py",
+      "extra_secret_files": ["tmp/configs/config_jira.json"],
+      "required_config_keys": ["api_url", "api_token", "start_date"],
+      "catalog_strategy": "preserve_existing",
+      "independent_streams": ["email_activities"],
+      "streams_per_task": 1,
+      "rate_limit_info": "5 requests/second per account (ActiveCampaign API docs, referenced in tap_activecampaign/client.py; the tap throttles itself to 5 req/s per process)",
+      "isolation_findings": [
+        "tap_activecampaign.sync.sync() is one loop over catalog.get_selected_streams() sharing one ActiveCampaign client (requests.Session) and one state dict.",
+        "SUB_STREAMS maps ecommerce_orders -> ecommerce_order_products, which the parent emits, so they form one work unit.",
+        "email_activities is listed as a child of contacts in the catalog but is NOT emitted by it: sync.py runs it separately via EmailActivities.sync_for_all_contacts(), so it is scheduled as an independent unit (registry independent_streams).",
+        "client.request() is wrapped in @utils.ratelimit(5, 1): a per-process limiter of 5 calls/second. Worker processes do not share it, so N workers can send up to 5N requests/second against one account - the main parallelism risk, measured through 429/throttle counters.",
+        "Requests are retried with backoff (max_tries=5, factor=2) for 5xx, 429 and OSError."
+      ],
+      "notes": "60 selected streams; email_activities requests every contact individually."
+    },
+    "tap-salesforce": {
+      "repo_path": "tap-salesforce",
+      "enabled": false,
+      "known_invalid_config": true,
+      "skip_reason": "Configuration is known to be invalid (existing catalog is empty: discovery never succeeded). To enable: fix tmp/configs/config.json, set enabled=true, known_invalid_config=false and catalog_strategy=discover_if_missing.",
+      "adapter": "process_isolation",
+      "config_path": "tmp/configs/config.json",
+      "discovery_command_path": "tmp/commands/discovery_run_command.txt",
+      "sync_command_path": "tmp/commands/sync_run_command.txt",
+      "catalog_path": "tmp/catalogs/catalog.json",
+      "output_path": "tmp/outputs/output.json",
+      "add_selected_script": "tmp/scripts/add_selected.py",
+      "extra_secret_files": ["tmp/configs/config_jira.json"],
+      "required_config_keys": ["client_id", "client_secret", "refresh_token", "start_date"],
+      "catalog_strategy": "preserve_existing",
+      "streams_per_task": 1,
+      "rate_limit_info": "UNKNOWN"
+    }
+  }
+}
