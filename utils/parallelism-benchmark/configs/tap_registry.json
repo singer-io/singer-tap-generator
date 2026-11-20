@@ -42,7 +42,7 @@
       "rate_limit_info": "UNKNOWN",
       "isolation_findings": [
         "tap_oracle_fusion.sync.sync() is one loop over catalog.get_selected_streams() sharing a single OracleClient (requests.Session), one BICCExtractClient and one state dict; all records go to one stdout.",
-        "Every selected stream is a BICC datastore extract (path biacm/rest/meta/datastores/...): an ESS job is created/reused per datastore, polled, and the extract file is downloaded before rows are yielded, so a record limit shortens only the post-download processing, not the server-side extraction.",
+        "Every selected stream is a BICC datastore extract (path biacm/rest/meta/datastores/...): an ESS job is created, polled (ess_poll_interval_seconds=20) and the extract file is fetched from UCM (ucm_poll_interval_seconds=12) before any row is yielded. Measured: every stream takes ~29-55 s and ~7 requests regardless of how many records it returns, so a record limit cannot shorten the run - the cost is the NUMBER of streams x worker counts (one BICC job each). Use max_streams / tap_max_streams to sample streams.",
         "BICC jobs are reused on the server between runs; the benchmark therefore sets bicc_force_full_sync=true in a temporary copy of the config so each run performs a full extract."
       ],
       "notes": "The existing catalog is the source of truth: its selected/unselected flags are preserved and only streams selected there are benchmarked; excluded streams are reported but never run."
@@ -94,6 +94,30 @@
         "Requests are retried with backoff (max_tries=5, factor=2) for 5xx, 429 and OSError."
       ],
       "notes": "60 selected streams; email_activities requests every contact individually."
+    },
+    "tap-chargify": {
+      "repo_path": "tap-chargify",
+      "enabled": true,
+      "adapter": "process_isolation",
+      "config_path": "tmp/configs/config.json",
+      "discovery_command_path": "tmp/commands/discovery_run_command.txt",
+      "sync_command_path": "tmp/commands/sync_run_command.txt",
+      "catalog_path": "tmp/catalogs/catalog.json",
+      "output_path": "tmp/outputs/output.json",
+      "add_selected_script": "tmp/scripts/add_selected.py",
+      "extra_secret_files": ["tmp/configs/config_jira.json"],
+      "required_config_keys": ["api_key", "subdomain", "start_date"],
+      "catalog_strategy": "discover_if_missing",
+      "streams_per_task": 1,
+      "rate_limit_info": "UNKNOWN",
+      "isolation_findings": [
+        "tap_chargify.sync() is one loop over catalog.streams (selected ones only) sharing one Chargify client and one state dict; every stream is independent (no parent/child streams in STREAMS).",
+        "Chargify.get() calls module-level requests.get() for every page, so there is no shared HTTP session: each request already opens its own connection (nothing to share between workers).",
+        "State is a plain dict written with singer.write_state(); with no --state file each process starts from start_date, so bookmarks cannot be cross-written between processes.",
+        "429 and 5xx are retried with backoff.expo (max_tries=5); other 4xx give up immediately (tap_chargify/chargify.py giveup()). There is no client-side limiter, so N workers send N times the request rate.",
+        "This repository has no existing catalog: the framework runs the tap's own discovery command into a new file under results/ and selects all streams (the tap's tmp/ folder is not touched)."
+      ],
+      "notes": "No existing catalog: discovered at benchmark time (catalog_strategy discover_if_missing). Measured unlimited: statements (~1200 records, 134 s) and transactions (~890 records, 91 s) dominate the 505 s sequential run because latency grows with the page count, so a record limit (shipped: 300) shortens this tap a lot."
     },
     "tap-salesforce": {
       "repo_path": "tap-salesforce",

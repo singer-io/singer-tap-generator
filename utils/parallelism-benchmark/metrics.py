@@ -6,7 +6,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from error_analyzer import (ErrorRecord, is_near_limit, is_throttle_signal, EXTRACTION_ERROR, UNKNOWN)
+from error_analyzer import (ErrorRecord, RATE_LIMIT_CATEGORIES, is_near_limit, is_throttle_signal, EXTRACTION_ERROR,
+                            UNKNOWN)
 
 # Stream / work-unit / run statuses
 COMPLETED = "COMPLETED"
@@ -43,6 +44,7 @@ class HttpSummary:
     rate_limit_headers: Dict[str, str] = field(default_factory=dict)
     request_seconds: float = 0.0
     measured: bool = False
+    unavailable: bool = False
 
 
 def summarize_events(events: List[Dict[str, Any]]) -> HttpSummary:
@@ -53,6 +55,8 @@ def summarize_events(events: List[Dict[str, Any]]) -> HttpSummary:
         if kind == "process_start":
             summary.measured = True
             summary.process_start_ts = event.get("ts")
+        elif kind == "http_unavailable":
+            summary.unavailable = True
         elif kind == "retry":
             summary.retries += 1
         elif kind == "giveup":
@@ -96,6 +100,8 @@ def summarize_events(events: List[Dict[str, Any]]) -> HttpSummary:
                 if "limit" in name and name != "ratelimit" and not any(k in name for k in ("remaining", "reset", "near")):
                     summary.rate_limit_headers.setdefault(name, value)
     summary.status_counts = dict(sorted(statuses.items()))
+    if summary.unavailable:
+        summary.measured = False     # requests was not importable: HTTP figures would be invented, so mark unmeasured
     return summary
 
 
@@ -202,6 +208,8 @@ class RunResult:
     configured_rate_limit: str = "UNKNOWN"
     worker_threads_started: int = 0
     record_limit_text: str = "unlimited"
+    environment_failure: str = ""        # set when a work unit could not even start the tap (missing package, ...)
+    stop_reason: str = ""                # why scheduling stopped early (empty when every unit was attempted)
 
     @property
     def wall_seconds(self) -> Optional[float]:
@@ -358,6 +366,19 @@ def run_metrics(run: RunResult) -> Dict[str, Any]:
     extraction_errors = sum(1 for e in run.errors if e.source == "process" and e.category in (EXTRACTION_ERROR, UNKNOWN))
     timed_out_units = sum(1 for u in ran if u.status == TIMED_OUT)
 
+    # Rate limiting: HTTP-level signals (429 / Retry-After on errors / exhausted quota header), rate-limit wording in
+    # the tap's logs, or a stream that failed because of it. UNKNOWN when HTTP could not be measured and nothing else shows it.
+    log_mentions = sum(u.throttle_log_mentions for u in ran)
+    process_rate_errors = sum(1 for e in run.errors if e.source == "process" and e.category in RATE_LIMIT_CATEGORIES)
+    http_signals = total("throttle_signals")
+    rate_signals = (http_signals or 0) + log_mentions + process_rate_errors
+    if not ran:
+        rate_limit_encountered = "N/A"
+    elif rate_signals > 0:
+        rate_limit_encountered = "YES"
+    else:
+        rate_limit_encountered = "NO" if http_measured else "UNKNOWN"
+
     if not units or not ran:
         status = SKIPPED if not units else FAILED
     elif failed == 0 and not_attempted == 0:
@@ -385,8 +406,13 @@ def run_metrics(run: RunResult) -> Dict[str, Any]:
         concurrency_verdict = "NO_OVERLAP_OBSERVED"
 
     limited_names = sorted(s for s, v in outcomes.items() if v == COMPLETED_WITH_LIMIT)
+    extraction_status = {COMPLETED: "SUCCESS", COMPLETED_WITH_LIMIT: "SUCCESS", PARTIAL: "PARTIAL",
+                         FAILED: "FAILURE", TIMED_OUT: "FAILURE", SKIPPED: "SKIPPED"}.get(status, "FAILURE")
     return {
         "benchmark_status": status,
+        "extraction_status": extraction_status,
+        "rate_limit_encountered": rate_limit_encountered,
+        "rate_limit_signals": rate_signals if ran else None,
         "total_streams": len(run.selected_streams),
         "scheduled_streams": len(outcomes),
         "successful_streams": successful,

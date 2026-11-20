@@ -26,7 +26,7 @@ from typing import Any, Deque, Dict, List, Optional
 
 from catalog_utils import RUNNER_PATH, WorkUnit
 from config import utc_iso
-from error_analyzer import Scrubber, StderrScanner, build_unit_errors
+from error_analyzer import ENVIRONMENT, Scrubber, StderrScanner, build_unit_errors
 from metrics import (RunResult, StreamTally, UnitResult, summarize_events, concurrency_stats,
                      COMPLETED, COMPLETED_WITH_LIMIT, FAILED, SKIPPED, TIMED_OUT, OK_STATUSES)
 from tap_registry import SyncCommand, TapSpec
@@ -309,13 +309,15 @@ class StreamScheduler:
     """Distributes work units over N worker slots and records who ran what, and when."""
 
     def __init__(self, executor: UnitExecutor, worker_count: int, timeout_seconds: float,
-                 stream_timeout_seconds: float, continue_on_failure: bool, logger: logging.Logger) -> None:
+                 stream_timeout_seconds: float, continue_on_failure: bool, logger: logging.Logger,
+                 fail_fast_after: Optional[int] = None) -> None:
         self.executor = executor
         self.worker_count = worker_count
         self.timeout_seconds = timeout_seconds
         self.stream_timeout_seconds = stream_timeout_seconds
         self.continue_on_failure = continue_on_failure
         self.logger = logger
+        self.fail_fast_after = fail_fast_after      # stop if this many units finished and none succeeded
 
     def run(self, run: RunResult, units: List[WorkUnit]) -> RunResult:
         queue: Deque[WorkUnit] = deque(units)
@@ -323,6 +325,8 @@ class StreamScheduler:
         stop = threading.Event()
         results: Dict[int, UnitResult] = {}
         worker_log: Dict[int, List[UnitResult]] = {}
+        finished = [0]
+        succeeded = [0]
         thread_count = min(self.worker_count, len(units)) or 0
         run.worker_threads_started = thread_count
         run.started_ts = time.time()
@@ -358,10 +362,33 @@ class StreamScheduler:
                 results[unit.index] = unit_result
                 worker_log[worker_id].append(unit_result)
                 self._log_unit_end(worker_id, unit_result)
+                with queue_lock:
+                    finished[0] += 1
+                    succeeded[0] += 1 if unit_result.status in OK_STATUSES else 0
+                    all_failed = (self.fail_fast_after is not None and finished[0] >= self.fail_fast_after
+                                  and succeeded[0] == 0)
+                env_error = next((e for e in unit_result.errors if e.source == "process" and e.category == ENVIRONMENT), None)
+                if env_error is not None and unit_result.status not in OK_STATUSES:
+                    run.environment_failure = run.environment_failure or "%s (work unit %s)" % (
+                        env_error.message, unit.unit_id)
+                    self.logger.error("[SCHEDULER] stopping: the tap could not start (%s). Results of this run are "
+                                      "not valid.", env_error.message)
+                    run.stopped_early = True
+                    run.stop_reason = run.stop_reason or "stopped: the tap could not start (environment failure)"
+                    stop.set()
+                elif all_failed and not stop.is_set():
+                    self.logger.error("[SCHEDULER] stopping: the first %d work unit(s) all failed and none succeeded; "
+                                      "continuing would only repeat the same failure", self.fail_fast_after)
+                    run.stop_reason = ("stopped after the first %d work units, all of which failed (none succeeded); "
+                                       "remaining units were not attempted" % self.fail_fast_after)
+                    run.stopped_early = True
+                    stop.set()
                 if unit_result.status not in OK_STATUSES and not self.continue_on_failure:
                     self.logger.error("[SCHEDULER] stopping: continue_on_stream_failure=false and unit=%s failed",
                                       unit.unit_id)
                     run.stopped_early = True
+                    run.stop_reason = run.stop_reason or ("stopped early after a failure "
+                                                          "(continue_on_stream_failure=false)")
                     stop.set()
 
         threads = [threading.Thread(target=worker_loop, args=(wid,), name="worker-%d" % wid, daemon=True)

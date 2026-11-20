@@ -77,13 +77,20 @@ class BenchmarkConfig:
     max_429_ratio: float = 0.10
     record_tolerance_pct: float = 2.0
     recommendation_min_speedup: float = 1.2
-    schedule_order: str = "catalog"
+    schedule_order: str = "longest_first"
+    check_environment: bool = True
+    baseline_fail_fast: int = 3
+    max_streams: Optional[int] = None
+    tap_max_streams: Dict[str, int] = field(default_factory=dict)
     sources: Dict[str, str] = field(default_factory=dict)
     # CLI-only record-limit layers (kept separate so precedence is explicit)
     cli_record_limit: Optional[int] = None
     cli_no_record_limit: bool = False
     cli_tap_record_limits: Dict[str, int] = field(default_factory=dict)
     cli_stream_record_limits: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    cli_max_streams: Optional[int] = None
+    cli_all_streams: bool = False
+    cli_tap_max_streams: Dict[str, int] = field(default_factory=dict)
 
     @property
     def effective_stream_timeout(self) -> int:
@@ -163,6 +170,35 @@ class RecordLimitPolicy:
         return "mixed (%s)" % ", ".join("%s x %d" % kv for kv in sorted(counts.items()))
 
 
+class StreamSamplePolicy:
+    """How many of a tap's selected work units to benchmark (``None`` = all).
+
+    Precedence (highest first): CLI ``--tap-max-streams TAP=N`` > CLI ``--all-streams`` / ``--max-streams N`` >
+    config ``tap_max_streams`` > config ``max_streams`` > all. A limit keeps the *first N* work units of the catalog
+    (deterministic, identical for every worker count), so a sampled run is still a like-for-like comparison.
+    """
+
+    def __init__(self, config: BenchmarkConfig, canonical: Callable[[str], str] = lambda n: n) -> None:
+        self.cfg_all = config.max_streams
+        self.cfg_tap = {canonical(k): v for k, v in config.tap_max_streams.items()}
+        self.cli_all = config.cli_max_streams
+        self.cli_off = config.cli_all_streams
+        self.cli_tap = {canonical(k): v for k, v in config.cli_tap_max_streams.items()}
+
+    def resolve(self, tap: str) -> Tuple[Optional[int], str]:
+        if tap in self.cli_tap:
+            return self.cli_tap[tap], "cli-tap"
+        if self.cli_off:
+            return None, "cli-all-streams"
+        if self.cli_all is not None:
+            return self.cli_all, "cli-global"
+        if tap in self.cfg_tap:
+            return self.cfg_tap[tap], "config-tap"
+        if self.cfg_all is not None:
+            return self.cfg_all, "config-global"
+        return None, "all-streams"
+
+
 def parse_limit_assignments(items: Optional[List[str]], nested: bool) -> Dict[Any, Any]:
     """Parse ``TAP=N`` (nested=False) or ``TAP:STREAM=N`` (nested=True) CLI assignments."""
     result: Dict[Any, Any] = {}
@@ -221,6 +257,14 @@ def validate_config(config: BenchmarkConfig) -> None:
         raise ConfigError("log_level must be one of %s" % ", ".join(LOG_LEVELS))
     if config.schedule_order not in SCHEDULE_ORDERS:
         raise ConfigError("schedule_order must be one of %s" % ", ".join(SCHEDULE_ORDERS))
+    if config.max_streams is not None:
+        config.max_streams = _positive_int(config.max_streams, "max_streams")
+    if not isinstance(config.tap_max_streams, dict):
+        raise ConfigError("tap_max_streams must be an object {tap: N}")
+    config.tap_max_streams = {str(k): _positive_int(v, "tap_max_streams[%s]" % k) for k, v in config.tap_max_streams.items()}
+    config.baseline_fail_fast = _positive_int(config.baseline_fail_fast, "baseline_fail_fast")
+    if not isinstance(config.check_environment, bool):
+        raise ConfigError("check_environment must be true or false")
     config.log_level = str(config.log_level).upper()
     if not 0 <= float(config.max_429_ratio) <= 1:
         raise ConfigError("max_429_ratio must be between 0 and 1")
@@ -254,16 +298,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="keep per-stream output files after merging")
     parser.add_argument("--native-baseline", action="store_true",
                         help="also run the tap's own unmodified single-process sync as a reference row")
-    parser.add_argument("--max-streams", type=int,
-                        help="limit scheduling units per tap (smoke tests; marks the run as limited)")
+    parser.add_argument("--max-streams", type=int, metavar="N",
+                        help="benchmark only the first N work units of every tap (cheaper runs; marked as a sampled run). "
+                             "Overrides max_streams / tap_max_streams from the config file")
+    parser.add_argument("--tap-max-streams", action="append", metavar="TAP=N",
+                        help="per-tap work-unit limit (repeatable; beats --max-streams)")
+    parser.add_argument("--all-streams", action="store_true", help="ignore max_streams / tap_max_streams from the config file")
+    parser.add_argument("--skip-env-check", action="store_true",
+                        help="do not run the tap readiness probe before benchmarking (not recommended)")
     parser.add_argument("--results-dir", help="where timestamped result folders are created")
     parser.add_argument("--logs-dir", help="where per-tap logs are written")
     parser.add_argument("--log-level", choices=LOG_LEVELS, help="framework log level")
     parser.add_argument("--schedule", choices=("catalog", "longest-first"),
-                        help="order in which work units are handed to workers (parallel runs): catalog order (default) "
-                             "or longest-first using the sequential baseline's durations")
+                        help="order in which work units are handed to workers in parallel runs: longest-first "
+                             "(default; uses the sequential baseline's durations so one slow stream cannot start last and "
+                             "dominate the result) or catalog order")
     parser.add_argument("--dry-run", action="store_true",
-                        help="validate taps and print the stream plan and record limits; run nothing")
+                        help="validate taps (including the readiness probe) and print the stream plan, record limits and "
+                             "number of planned runs; run nothing")
     parser.add_argument("--run-id", default=None, help="override the generated run id (default: timestamp)")
     parser.add_argument("--list-taps", action="store_true", help="list registry taps and exit")
     return parser
@@ -274,7 +326,7 @@ def load_config(args: argparse.Namespace) -> BenchmarkConfig:
     config = BenchmarkConfig()
     sources = {f.name: "default" for f in fields(config) if f.name != "sources"}
     cli_only = {"sources", "cli_record_limit", "cli_no_record_limit", "cli_tap_record_limits",
-                "cli_stream_record_limits"}
+                "cli_stream_record_limits", "cli_max_streams", "cli_all_streams", "cli_tap_max_streams"}
     known = {f.name for f in fields(config)} - cli_only
     if args.config:
         if not os.path.isfile(args.config):
@@ -330,6 +382,15 @@ def load_config(args: argparse.Namespace) -> BenchmarkConfig:
         override("log_level", args.log_level)
     if args.schedule:
         override("schedule_order", args.schedule.replace("-", "_"))
+    if args.skip_env_check:
+        override("check_environment", False)
+    if args.max_streams is not None:
+        config.cli_max_streams = _positive_int(args.max_streams, "--max-streams")
+        sources["max_streams"] = "cli (--max-streams overrides all config stream limits)"
+    config.cli_all_streams = bool(args.all_streams)
+    if args.all_streams:
+        sources["max_streams"] = "cli (--all-streams)"
+    config.cli_tap_max_streams = parse_limit_assignments(args.tap_max_streams, nested=False)
     if args.record_limit is not None:
         config.cli_record_limit = _positive_int(args.record_limit, "--record-limit")
         sources["default_record_limit"] = "cli (--record-limit overrides all config limits)"

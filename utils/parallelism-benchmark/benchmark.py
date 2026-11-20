@@ -14,20 +14,25 @@ from typing import Any, Dict, List, Optional
 from adapters import get_adapter
 from catalog_utils import (StreamPlan, WorkUnit, plan_units, run_discovery_into, write_unit_catalogs,
                            write_working_catalog)
-from config import (BenchmarkConfig, ConfigError, FRAMEWORK_DIR, RecordLimitPolicy, build_arg_parser, load_config,
-                    new_run_id, unique_path, utc_iso)
-from decision import Decision, evaluate_tap, skipped_decision
+from config import (BenchmarkConfig, ConfigError, FRAMEWORK_DIR, RecordLimitPolicy, StreamSamplePolicy,
+                    build_arg_parser, load_config, new_run_id, unique_path, utc_iso)
+from decision import (BASIS_ENVIRONMENT, Decision, evaluate_tap, not_evaluated_decision)
 from error_analyzer import Scrubber
 from executor import StreamScheduler, UnitExecutor, close_logger, make_run_logger
 from metrics import (COMPLETED, COMPLETED_WITH_LIMIT, FAILED, PARTIAL, RunResult, SKIPPED, TIMED_OUT,
                      build_stream_results, compare_records, compare_to_baseline, run_metrics, stream_outcomes)
 from output_merger import merge_unit_outputs
+from probe import probe_environment
 from report_generator import (DECISION_SCOPE, TapSection, skipped_row, write_csv, write_error_csv,
                               write_stream_csv, write_summary_json, write_txt)
 from results_store import (REPORT_CSV, RUN_MARKER, create_run_dir, write_latest)
-from tap_registry import (STATUS_READY, STATUS_INVALID_CONFIG, TapSpec, collect_secrets, describe_environment,
-                          load_json_file, load_registry, parse_sync_command, preflight, resolve_tap_name,
-                          RegistryError)
+from tap_registry import (STATUS_READY, STATUS_ENV_ERROR, STATUS_INVALID_CONFIG, TapSpec, collect_secrets,
+                          describe_environment, load_json_file, load_registry, parse_sync_command, preflight,
+                          resolve_tap_name, RegistryError)
+
+
+class _EnvironmentAbort(Exception):
+    """A work unit could not start the tap (missing package/entry point): the tap's results are not valid."""
 
 
 def _console(message: str) -> None:
@@ -82,8 +87,12 @@ def build_row(spec: TapSpec, run: RunResult, baseline_metrics: Optional[Dict[str
               config: BenchmarkConfig) -> Dict[str, Any]:
     metrics = run_metrics(run)
     row: Dict[str, Any] = dict(metrics)
-    comparable = (baseline_metrics is not None and metrics["benchmark_status"] not in (FAILED, TIMED_OUT, SKIPPED)
-                  and baseline_metrics.get("benchmark_status") not in (FAILED, TIMED_OUT, SKIPPED))
+    completed = (baseline_metrics is not None and metrics["benchmark_status"] not in (FAILED, TIMED_OUT, SKIPPED)
+                 and baseline_metrics.get("benchmark_status") not in (FAILED, TIMED_OUT, SKIPPED))
+    # A speedup only means something if the same work was done: a run that got faster by failing streams (or by
+    # succeeding at more streams than the baseline) is not comparable.
+    same_work = completed and metrics["successful_streams"] == baseline_metrics.get("successful_streams")
+    comparable = completed and same_work
     if run.mode == "stream_pool":
         row.update(compare_to_baseline(metrics, baseline_metrics if comparable else None, run.worker_count))
         if baseline_metrics is not None and not comparable:
@@ -96,17 +105,18 @@ def build_row(spec: TapSpec, run: RunResult, baseline_metrics: Optional[Dict[str
     not_run = [s for s, st in outcomes.items() if st == SKIPPED]
     notes = list(run.notes)
     if run.mode == "stream_pool" and baseline_metrics is not None:
-        if not comparable:
+        if not completed:
             notes.append("speedup not computed: this run or the baseline failed completely")
-        elif metrics["successful_streams"] != baseline_metrics.get("successful_streams"):
-            notes.append("work differs from baseline (%s vs %s successful streams): speedup is not like-for-like"
-                         % (metrics["successful_streams"], baseline_metrics.get("successful_streams")))
+        elif not same_work:
+            notes.append("speedup not computed: not like-for-like (%s successful streams vs %s in the baseline) - a run "
+                         "that fails streams is faster for the wrong reason" % (
+                             metrics["successful_streams"], baseline_metrics.get("successful_streams")))
     if plan.limited and plan.filtered_streams:
         notes.append("limited run: %d selected stream(s) not scheduled (filters/--max-streams)" % len(plan.filtered_streams))
     if run.run_timed_out:
         notes.append("run timeout budget exhausted")
-    if run.stopped_early:
-        notes.append("stopped early after a failure (continue_on_stream_failure=false)")
+    if run.stop_reason:
+        notes.append(run.stop_reason)
     if spec.config_overrides:
         notes.append("config overrides applied to a working copy: %s" % ", ".join(sorted(spec.config_overrides)))
     row.update({
@@ -150,7 +160,9 @@ def execute_run(spec: TapSpec, config: BenchmarkConfig, plan: StreamPlan, units:
         executor = UnitExecutor(spec, sync_cmd, python, scrubber, run_dir, worker_count, logger, working_config,
                                 enforce_limits=(mode == "stream_pool"))
         scheduler = StreamScheduler(executor, worker_count, config.timeout_seconds, config.effective_stream_timeout,
-                                    config.continue_on_stream_failure, logger)
+                                    config.continue_on_stream_failure, logger,
+                                    fail_fast_after=config.baseline_fail_fast
+                                    if (mode == "stream_pool" and worker_count == 1) else None)
         try:
             scheduler.run(run, units)
         except KeyboardInterrupt:
@@ -201,7 +213,10 @@ def apply_decision(section: TapSection, decision: Decision, baseline_workers: in
     summary = " ".join(decision.reasons[-2:])[:600]
     for row in section.rows:
         row["can_parallel_extraction_be_done"] = decision.can_parallel
+        row["max_workers_successfully_tested"] = decision.max_workers_successfully_tested
+        row["max_recommended_workers_without_rate_limit"] = decision.max_workers_without_rate_limit
         row["recommended_worker_count"] = decision.recommended_workers
+        row["evaluation_status"] = decision.evaluation_status
         row["decision_scope"] = DECISION_SCOPE
         row["decision_basis"] = decision.basis
         row["decision_summary"] = summary
@@ -212,22 +227,31 @@ def apply_decision(section: TapSection, decision: Decision, baseline_workers: in
             row["worker_count_safe"] = "BASELINE"
         else:
             verdict = decision.verdicts.get(int(workers)) if workers not in (None, "") else None
-            row["worker_count_safe"] = ("YES" if verdict.safe else "NO") if verdict else "N/A"
+            if verdict is None:
+                row["worker_count_safe"] = "N/A"
+            elif verdict.safe:
+                row["worker_count_safe"] = "YES"
+            elif verdict.non_concurrency_failures_only:
+                row["worker_count_safe"] = "INCONCLUSIVE"       # only network/auth/environment errors: not a concurrency result
+            else:
+                row["worker_count_safe"] = "NO"
             if verdict:
                 row["worker_safety_notes"] = "; ".join("%s: %s" % (c.name, c.detail) for c in verdict.failed_checks) or \
                     ("; ".join(verdict.warnings) or "all checks passed")
 
 
 def benchmark_tap(spec: TapSpec, config: BenchmarkConfig, policy: RecordLimitPolicy, run_id: str, run_dir: str,
-                  max_units: Optional[int]) -> TapSection:
+                  max_units: Optional[int], sample_source: str = "all-streams") -> TapSection:
     section = TapSection(tap_name=spec.name, rate_limit_info=spec.rate_limit_info)
 
-    def skip(status: str, reasons: List[str]) -> TapSection:
+    def skip(status: str, reasons: List[str], basis: str = "NOT_EVALUATED_SKIPPED") -> TapSection:
         section.status = status
         section.skip_reasons = reasons
+        section.rows, section.errors, section.stream_results, section.stream_outcomes = [], [], [], {}
         section.rows.append(skipped_row(spec.name, status, reasons, run_id, spec.rate_limit_info))
-        section.decision = skipped_decision(spec.name, reasons, list(spec.isolation_findings))
+        section.decision = not_evaluated_decision(spec.name, reasons, basis, list(spec.isolation_findings))
         for row in section.rows:
+            row["decision_basis"] = basis
             row["recommended_worker_count"] = 0
         _console("[%s] %s: %s" % (spec.name, status, "; ".join(reasons)))
         return section
@@ -242,6 +266,14 @@ def benchmark_tap(spec: TapSpec, config: BenchmarkConfig, policy: RecordLimitPol
         return skip(STATUS_INVALID_CONFIG, [str(exc)])
     if problems:
         return skip(STATUS_INVALID_CONFIG, problems)
+    if config.check_environment:
+        probe = probe_environment(spec)
+        if not probe.ok:
+            reasons = ["tap cannot be started with its own virtualenv: %s" % probe.error]
+            if probe.hint:
+                reasons.append(probe.hint)
+            return skip(STATUS_ENV_ERROR, reasons, BASIS_ENVIRONMENT)
+        _console("[%s] environment OK (python %s, requests %s)" % (spec.name, probe.python, probe.requests_version))
 
     tap_dir = os.path.join(run_dir, "artifacts", spec.name)
     os.makedirs(tap_dir, exist_ok=True)
@@ -282,8 +314,10 @@ def benchmark_tap(spec: TapSpec, config: BenchmarkConfig, policy: RecordLimitPol
     python = spec.python_executable()
     working_config = prepare_working_config(spec, tap_dir)
     if plan.filtered_streams:
-        section.notes.append("limited run: only %d of %d selected streams were scheduled" % (
-            len(scheduled_selected), len(plan.selected_streams)))
+        section.notes.append("SAMPLED run (%s): only %d of %d selected streams were benchmarked - the first %s work units "
+                             "of the catalog - identically for every worker count. Change with max_streams / "
+                             "tap_max_streams / --all-streams." % (
+                                 sample_source, len(scheduled_selected), len(plan.selected_streams), max_units))
     if spec.config_overrides:
         section.notes.append("benchmark-only config overrides on a working copy of the config: %s. "
                              "The original config file was not modified." % json.dumps(spec.config_overrides))
@@ -292,7 +326,8 @@ def benchmark_tap(spec: TapSpec, config: BenchmarkConfig, policy: RecordLimitPol
                              "reached (status COMPLETED_WITH_LIMIT); the same limits apply to every worker count." % limit_text)
     if config.schedule_order == "longest_first":
         section.notes.append("schedule: parallel runs hand work units to workers longest-first (durations taken from the "
-                             "sequential baseline, which itself runs in catalog order).")
+                             "sequential baseline, which itself runs in catalog order), so one slow stream cannot "
+                             "start last and dominate the result.")
     if spec.notes:
         section.notes.append(spec.notes)
 
@@ -305,6 +340,8 @@ def benchmark_tap(spec: TapSpec, config: BenchmarkConfig, policy: RecordLimitPol
         if native_unit is not None:
             native = execute_run(spec, config, plan, [native_unit], 1, "native_sequential", tap_dir, sync_cmd, scrubber,
                                  working_config, run_id, python, limit_text)
+            if native.environment_failure:
+                raise _EnvironmentAbort(native.environment_failure)
             section.rows.append(build_row(spec, native, None, None, run_id, plan, config))
             section.errors.extend(native.errors)
             section.notes.append("Row mode 'native_sequential' is the tap's own unmodified single-process sync; "
@@ -317,6 +354,8 @@ def benchmark_tap(spec: TapSpec, config: BenchmarkConfig, policy: RecordLimitPol
                 units_for_run = sorted(plan.units, key=lambda u, d=durations: -d.get(u.unit_id, 0.0))
             run = execute_run(spec, config, plan, units_for_run, workers, "stream_pool", tap_dir, sync_cmd, scrubber,
                               working_config, run_id, python, limit_text)
+            if run.environment_failure:
+                raise _EnvironmentAbort(run.environment_failure)
             if workers > 1 and units_for_run is not plan.units:
                 run.notes.append("work units scheduled longest-first (durations from the sequential baseline)")
             row = build_row(spec, run, baseline_metrics, baseline_run, run_id, plan, config)
@@ -338,6 +377,18 @@ def benchmark_tap(spec: TapSpec, config: BenchmarkConfig, policy: RecordLimitPol
             if config.stop_on_unstable_run and workers > 1 and unstable:
                 section.notes.append("higher worker counts not tried: run at %d workers was unstable" % workers)
                 break
+            if workers == 1 and metrics_by_workers[1]["successful_streams"] == 0:
+                section.notes.append("higher worker counts were NOT run: the sequential baseline did not extract any "
+                                     "stream, so there is nothing to compare against (fix the cause shown in the "
+                                     "errors and re-run)")
+                _console("[%s] baseline extracted nothing - skipping the parallel runs" % spec.name)
+                break
+    except _EnvironmentAbort as abort:
+        return skip(STATUS_ENV_ERROR, [
+            "the tap stopped being runnable during the benchmark: %s" % abort,
+            "all results of this tap are discarded (they would measure the broken environment, not the tap). Verify "
+            "with 'python benchmark.py --dry-run --taps %s', fix the tap's virtualenv, and re-run" % spec.name],
+            BASIS_ENVIRONMENT)
     finally:
         if working_config and os.path.isfile(working_config):
             os.remove(working_config)
@@ -350,18 +401,29 @@ def benchmark_tap(spec: TapSpec, config: BenchmarkConfig, policy: RecordLimitPol
     return section
 
 
-def print_plan(spec: TapSpec, policy: RecordLimitPolicy, max_units: Optional[int]) -> None:
+def print_plan(spec: TapSpec, policy: RecordLimitPolicy, max_units: Optional[int], sample_source: str,
+               config: BenchmarkConfig) -> None:
     pre = preflight(spec)
     print("%s: %s" % (spec.name, pre.status))
     for reason in pre.reasons:
         print("    - %s" % reason)
     if pre.status != STATUS_READY:
         return
+    if config.check_environment:
+        print("    environment: %s" % probe_environment(spec).summary())
+    if pre.needs_discovery:
+        print("    catalog: no usable existing catalog - discovery will run at benchmark time (one API call) and all "
+              "streams will be selected; the plan is shown once discovered")
+        return
     plan = plan_units(load_json_file(spec.abs_catalog), spec, max_units, policy.limit_for(spec.name))
-    print("    catalog streams=%d selected=%d excluded=%d filtered=%d work_units=%d record_limit=%s" % (
+    print("    catalog streams=%d selected=%d excluded=%d benchmarked=%d work_units=%d record_limit=%s" % (
         plan.total_catalog_streams, len(plan.selected_streams), len(plan.excluded_streams),
-        len(plan.filtered_streams), len(plan.units), policy.describe(spec.name, plan.scheduled_selected)))
+        len(plan.scheduled_selected), len(plan.units), policy.describe(spec.name, plan.scheduled_selected)))
+    if plan.filtered_streams:
+        print("    SAMPLED (%s): %d selected stream(s) are not benchmarked" % (sample_source, len(plan.filtered_streams)))
     print("    python=%s" % spec.python_executable())
+    print("    planned runs: %d worker count(s) %s x %d work unit(s) = %d tap process(es)" % (
+        len(config.workers), config.workers, len(plan.units), len(config.workers) * len(plan.units)))
     for unit in plan.units[:25]:
         limits = {s: policy.resolve(spec.name, s) for s in unit.selected}
         shown = ",".join("%s[%s]" % (s, "unlimited" if lim is None else "%s:%s" % (lim, src))
@@ -371,12 +433,24 @@ def print_plan(spec: TapSpec, policy: RecordLimitPolicy, max_units: Optional[int
         print("      ... %d more units" % (len(plan.units) - 25))
 
 
+def _lenient_resolver(registry: Dict[str, TapSpec]):
+    """Map aliases to canonical tap names, but leave unknown names alone: a config file may carry limits for taps that
+    a smaller registry (e.g. a folder containing a single tap) does not list."""
+    def resolve(name: str) -> str:
+        try:
+            return resolve_tap_name(registry, name)
+        except RegistryError:
+            return name
+    return resolve
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
         config = load_config(args)
         registry = load_registry(config.registry_path)
-        policy = RecordLimitPolicy(config, lambda name: resolve_tap_name(registry, name))
+        policy = RecordLimitPolicy(config, _lenient_resolver(registry))
+        sampler = StreamSamplePolicy(config, _lenient_resolver(registry))
         requested = [resolve_tap_name(registry, name) for name in (config.enabled_taps or list(registry))]
     except (ConfigError, RegistryError, OSError, ValueError) as exc:
         print("error: %s" % exc, file=sys.stderr)
@@ -396,7 +470,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.dry_run:
         for name in ordered:
-            print_plan(registry[name], policy, args.max_streams)
+            limit, source = sampler.resolve(name)
+            print_plan(registry[name], policy, limit, source, config)
         return 0
 
     run_id = args.run_id or new_run_id(config.results_dir)
@@ -419,19 +494,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                 reasons = pre.reasons or ["not enabled for this run"]
                 section = TapSection(tap_name=name, status=status, skip_reasons=reasons, rate_limit_info=spec.rate_limit_info)
                 section.rows.append(skipped_row(name, status, reasons, run_id, spec.rate_limit_info))
-                section.decision = skipped_decision(name, reasons)
+                section.decision = not_evaluated_decision(name, reasons)
                 sections.append(section)
                 _console("[%s] %s: %s" % (name, status, "; ".join(reasons)))
                 continue
             try:
-                sections.append(benchmark_tap(spec, config, policy, run_id, run_dir, args.max_streams))
+                limit, source = sampler.resolve(name)
+                sections.append(benchmark_tap(spec, config, policy, run_id, run_dir, limit, source))
             except Exception as exc:  # pylint: disable=broad-except
                 reasons = ["framework error while benchmarking: %s: %s" % (type(exc).__name__, exc)]
                 _console("[%s] ERROR %s\n%s" % (name, reasons[0], traceback.format_exc()))
                 section = TapSection(tap_name=name, status="SKIPPED_ERROR", skip_reasons=reasons,
                                      rate_limit_info=spec.rate_limit_info)
                 section.rows.append(skipped_row(name, "FAILED", reasons, run_id, spec.rate_limit_info))
-                section.decision = skipped_decision(name, reasons)
+                section.decision = not_evaluated_decision(name, reasons)
                 sections.append(section)
     except KeyboardInterrupt:
         interrupted = True

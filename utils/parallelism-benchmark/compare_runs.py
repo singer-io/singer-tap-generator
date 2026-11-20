@@ -51,9 +51,14 @@ def compare(run_a: str, run_b: str, tap: Optional[str] = None) -> List[str]:
                       "%.1f" % da if da is not None else "-", "%.1f" % db if db is not None else "-", _delta(da, db),
                       a.get("speedup") or "-", b.get("speedup") or "-",
                       "%s/%s" % (a.get("can_parallel_extraction_be_done", "-"), b.get("can_parallel_extraction_be_done", "-")),
-                      "%s/%s" % (a.get("recommended_worker_count", "-"), b.get("recommended_worker_count", "-"))])
+                      "%s/%s" % (a.get("max_workers_successfully_tested", "-"), b.get("max_workers_successfully_tested", "-")),
+                      "%s/%s" % (a.get("max_recommended_workers_without_rate_limit", "-"),
+                                 b.get("max_recommended_workers_without_rate_limit", "-")),
+                      "%s/%s" % (a.get("recommended_worker_count", "-"), b.get("recommended_worker_count", "-")),
+                      "%s/%s" % (a.get("evaluation_status", "-"), b.get("evaluation_status", "-"))])
     return render_table(["Tap", "Workers", "Status A", "Status B", "Duration A (s)", "Duration B (s)", "Change",
-                         "Speedup A", "Speedup B", "Parallel? A/B", "Recommended A/B"], table)
+                         "Speedup A", "Speedup B", "Parallel? A/B", "Max OK A/B", "Max w/o RL A/B", "Recommended A/B",
+                         "Evaluation A/B"], table)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

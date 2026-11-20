@@ -14,13 +14,19 @@ NETWORK = "NETWORK"
 SERVER_ERROR = "SERVER_ERROR"
 TIMEOUT = "TIMEOUT"
 CLIENT_ERROR = "CLIENT_ERROR"
+ENVIRONMENT = "ENVIRONMENT"          # the tap could not start: missing package/entry point/file. Not an API result.
 EXTRACTION_ERROR = "EXTRACTION_ERROR"
 UNKNOWN = "UNKNOWN"
+
+RATE_LIMIT_CATEGORIES = (RATE_LIMIT, THROTTLING)
 
 TRACKED_STATUSES = (400, 401, 403, 404, 408, 409, 429, 500, 502, 503, 504)
 
 THROTTLE_TEXT = re.compile(
     r"(rate[\s_-]?limit|too many requests|throttl|quota (?:has been )?exceeded|request limit|retry[\s_-]?after)", re.I)
+_ENVIRONMENT_TEXT = re.compile(
+    r"(ModuleNotFoundError|ImportError|No module named|console script .* not found|^worker_runner:|"
+    r"FileNotFoundError|No such file or directory|cannot find the (?:file|path) specified)", re.I)
 _TIMEOUT_EXC = re.compile(r"timeout|timed out", re.I)
 _NETWORK_EXC = re.compile(
     r"(connection|chunkedencoding|ssl|proxy|name or service|getaddrinfo|reset by peer|broken pipe|remotedisconnected)", re.I)
@@ -133,6 +139,8 @@ def classify_text(text: str) -> Optional[str]:
     """Classify a free-text failure message; None when nothing specific is recognised."""
     if not text:
         return None
+    if _ENVIRONMENT_TEXT.search(text):
+        return ENVIRONMENT
     match = _STATUS_IN_TEXT.search(text)
     if match:
         status = int(match.group(1) or match.group(2))
@@ -167,7 +175,7 @@ class StderrScanner:
             self.throttle_mentions += 1
         if "Backing off" in stripped:
             self.retry_mentions += 1
-        if stripped.startswith(("CRITICAL", "ERROR", "FATAL")):
+        if stripped.startswith(("CRITICAL", "ERROR", "FATAL", "worker_runner:")):
             self.last_error_line = stripped[:500]
             if len(self.error_lines) < 50:
                 self.error_lines.append(self.last_error_line)

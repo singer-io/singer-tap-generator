@@ -1,16 +1,37 @@
-"""Safety evaluation: can this tap extract streams in parallel, and with how many workers?"""
+"""Safety evaluation: can this tap extract streams in parallel, and with how many workers?
+
+Three separate questions are answered from the *measured* runs (nothing is assumed from configuration):
+
+1. ``can_parallel`` (YES/NO)            - did at least one parallel worker count technically work and pass every check?
+2. ``max_workers_successfully_tested``  - the highest worker count whose run passed every check.
+3. ``max_workers_without_rate_limit``   - the highest worker count such that it, and every lower tested count, ran
+                                          without any rate-limit signal.
+
+``evaluation_status`` says how much to trust the answer: CONCLUSIVE, INCONCLUSIVE (e.g. the sequential baseline failed,
+or the only failures were network/auth/environment errors that have nothing to do with concurrency) or NOT_EVALUATED.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
 from config import BenchmarkConfig
+from error_analyzer import AUTH, ENVIRONMENT, NETWORK
 from metrics import (COMPLETED, COMPLETED_WITH_LIMIT, OK_STATUSES, PARTIAL, RunResult, stream_outcomes)
 
 BASIS_EVALUATED = "EVALUATED"
 BASIS_SKIPPED = "NOT_EVALUATED_SKIPPED"
 BASIS_NO_PARALLEL_RUN = "NOT_EVALUATED_NO_PARALLEL_RUN"
 BASIS_BASELINE_FAILED = "NOT_EVALUATED_BASELINE_FAILED"
+BASIS_ENVIRONMENT = "NOT_EVALUATED_ENVIRONMENT"
+BASIS_TRANSIENT = "EVALUATED_TRANSIENT_FAILURES_ONLY"
+
+CONCLUSIVE = "CONCLUSIVE"
+INCONCLUSIVE = "INCONCLUSIVE"
+NOT_EVALUATED = "NOT_EVALUATED"
+
+# Failures in these categories are not caused by running streams concurrently.
+NON_CONCURRENCY_CATEGORIES = (NETWORK, AUTH, ENVIRONMENT)
 
 
 @dataclass
@@ -23,10 +44,13 @@ class Check:
 @dataclass
 class WorkerVerdict:
     workers: int
-    safe: bool
+    safe: bool                               # technically OK and any rate limiting was recovered
+    technical_ok: bool
+    rate_limited: bool                       # any rate-limit signal observed in this run
     speedup: Optional[float]
     checks: List[Check] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    non_concurrency_failures_only: bool = False
 
     @property
     def failed_checks(self) -> List[Check]:
@@ -36,9 +60,12 @@ class WorkerVerdict:
 @dataclass
 class Decision:
     tap_name: str
-    can_parallel: str                      # "YES" | "NO"
-    recommended_workers: int               # 0 = no safe parallel config, 1 = viable but no gain, >=2 recommended
+    can_parallel: str                        # "YES" | "NO"
+    recommended_workers: int                 # 0 = none, 1 = parallel viable but no gain, >=2 recommended
     basis: str
+    evaluation_status: str = CONCLUSIVE
+    max_workers_successfully_tested: int = 0
+    max_workers_without_rate_limit: int = 0
     best_speedup: Optional[float] = None
     verdicts: Dict[int, WorkerVerdict] = field(default_factory=dict)
     reasons: List[str] = field(default_factory=list)
@@ -48,19 +75,28 @@ class Decision:
     def as_dict(self) -> Dict[str, Any]:
         return {
             "tap_name": self.tap_name, "can_parallel_extraction_be_done": self.can_parallel,
-            "recommended_worker_count": self.recommended_workers, "basis": self.basis,
-            "best_safe_speedup": self.best_speedup, "reasons": self.reasons, "warnings": self.warnings,
-            "technical_findings": self.technical_findings,
+            "max_workers_successfully_tested": self.max_workers_successfully_tested,
+            "max_recommended_workers_without_rate_limit": self.max_workers_without_rate_limit,
+            "recommended_worker_count": self.recommended_workers, "evaluation_status": self.evaluation_status,
+            "basis": self.basis, "best_safe_speedup": self.best_speedup, "reasons": self.reasons,
+            "warnings": self.warnings, "technical_findings": self.technical_findings,
             "worker_verdicts": {
-                str(w): {"safe": v.safe, "speedup": v.speedup, "warnings": v.warnings,
+                str(w): {"safe": v.safe, "technical_ok": v.technical_ok, "rate_limited": v.rate_limited,
+                         "speedup": v.speedup, "warnings": v.warnings,
                          "checks": [{"name": c.name, "passed": c.passed, "detail": c.detail} for c in v.checks]}
-                for w, v in sorted(self.verdicts.items())},
-        }
+                for w, v in sorted(self.verdicts.items())}}
 
 
-def skipped_decision(tap_name: str, reasons: List[str], findings: Optional[List[str]] = None) -> Decision:
-    return Decision(tap_name=tap_name, can_parallel="NO", recommended_workers=0, basis=BASIS_SKIPPED,
-                    reasons=["Tap was not benchmarked: " + "; ".join(reasons)], technical_findings=findings or [])
+def not_evaluated_decision(tap_name: str, reasons: List[str], basis: str = BASIS_SKIPPED,
+                           findings: Optional[List[str]] = None) -> Decision:
+    """Decision for a tap that could not be benchmarked (skipped, bad environment, ...). The column stays YES/NO,
+    so the answer is NO - but ``evaluation_status`` makes clear that nothing was actually evaluated."""
+    return Decision(tap_name=tap_name, can_parallel="NO", recommended_workers=0, basis=basis,
+                    evaluation_status=NOT_EVALUATED, reasons=["Tap was not benchmarked: " + "; ".join(reasons)],
+                    technical_findings=findings or [])
+
+
+skipped_decision = not_evaluated_decision      # backwards-compatible name
 
 
 def _failed_streams(outcomes: Dict[str, str]) -> Set[str]:
@@ -80,6 +116,18 @@ def _data_loss(current: RunResult, baseline: RunResult, tolerance_pct: float) ->
             if cur.get(stream, 0) < expected - slack:
                 losses.append("%s (%d vs baseline %d)" % (stream, cur.get(stream, 0), expected))
     return losses
+
+
+def _new_failure_categories(run: RunResult, baseline: RunResult) -> Set[str]:
+    """Error categories of the process-level failures of units that failed only in the parallel run."""
+    base_failed = _failed_streams(stream_outcomes(baseline))
+    categories: Set[str] = set()
+    for unit in run.units:
+        if unit.status in OK_STATUSES or all(s in base_failed for s in unit.streams):
+            continue
+        process = [e.category for e in unit.errors if e.source == "process"]
+        categories.update(process or ["UNKNOWN"])
+    return categories
 
 
 def _verdict(workers: int, run: RunResult, metrics: Dict[str, Any], baseline: RunResult,
@@ -123,17 +171,19 @@ def _verdict(workers: int, run: RunResult, metrics: Dict[str, Any], baseline: Ru
     extra_timeouts = (metrics["timeout_count"] or 0) - (base_metrics["timeout_count"] or 0)
     checks.append(Check("no_added_timeouts", extra_timeouts <= 0,
                         "no timeouts beyond the baseline" if extra_timeouts <= 0 else "%d additional timeout(s)" % extra_timeouts))
+    technical_ok = all(c.passed for c in checks)
 
-    # 6. rate limiting must be recoverable
+    # 6. rate limiting must be recoverable (reported separately from the technical result)
     requests = metrics["api_request_count"] or 0
     c429 = metrics["http_429_count"] or 0
     ratio = (c429 / requests) if requests else 0.0
     giveups = (metrics["giveup_count"] or 0) - (base_metrics["giveup_count"] or 0)
     throttled_failures = [e for e in run.errors if e.source == "process" and e.category in ("RATE_LIMIT", "THROTTLING")]
     throttle_ok = not throttled_failures and giveups <= 0 and ratio <= config.max_429_ratio
+    rate_limited = metrics.get("rate_limit_encountered") == "YES"
     if throttle_ok:
         detail = "no unrecovered rate limiting"
-        if c429 or (metrics["throttling_count"] or 0):
+        if rate_limited:
             detail = "%d HTTP 429 (%.1f%% of %d requests) and %d throttle signal(s), all recovered by the tap's retries" % (
                 c429, ratio * 100, requests, metrics["throttling_count"] or 0)
             warnings.append(detail)
@@ -142,27 +192,49 @@ def _verdict(workers: int, run: RunResult, metrics: Dict[str, Any], baseline: Ru
                  "429 ratio %.1f%% (limit %.0f%%)" % (len(throttled_failures), giveups, ratio * 100, config.max_429_ratio * 100)
     checks.append(Check("rate_limiting_recoverable", throttle_ok, detail))
 
-    safe = all(c.passed for c in checks)
-    return WorkerVerdict(workers=workers, safe=safe, speedup=speedup, checks=checks, warnings=warnings)
+    safe = technical_ok and throttle_ok
+    non_concurrency_only = False
+    if not safe:
+        categories = _new_failure_categories(run, baseline)
+        non_concurrency_only = bool(categories) and categories <= set(NON_CONCURRENCY_CATEGORIES)
+        if non_concurrency_only:
+            warnings.append("failures were %s errors, which are not caused by concurrency (likely transient or "
+                            "environmental) - re-run before trusting this result" % "/".join(sorted(categories)))
+    if metrics.get("rate_limit_encountered") == "UNKNOWN":
+        warnings.append("HTTP traffic could not be measured (requests not used by this tap), so the absence of rate "
+                        "limiting cannot be confirmed")
+    return WorkerVerdict(workers=workers, safe=safe, technical_ok=technical_ok, rate_limited=rate_limited,
+                         speedup=speedup, checks=checks, warnings=warnings,
+                         non_concurrency_failures_only=non_concurrency_only)
 
 
 def evaluate_tap(tap_name: str, runs: Dict[int, RunResult], metrics: Dict[int, Dict[str, Any]],
                  speedups: Dict[int, Optional[float]], config: BenchmarkConfig,
                  technical_findings: Optional[List[str]] = None) -> Decision:
-    """Decide YES/NO and the recommended worker count from the actual benchmark runs."""
+    """Decide YES/NO, the safe worker counts and the rate-limit-free worker count from the actual runs."""
     decision = Decision(tap_name=tap_name, can_parallel="NO", recommended_workers=0, basis=BASIS_EVALUATED,
                         technical_findings=list(technical_findings or []))
-    baseline = runs.get(1)
-    base_metrics = metrics.get(1)
+    baseline, base_metrics = runs.get(1), metrics.get(1)
     if baseline is None or base_metrics is None or base_metrics["successful_streams"] == 0:
         decision.basis = BASIS_BASELINE_FAILED
-        decision.reasons.append("The sequential (1-worker) baseline did not extract any stream successfully "
-                                "(status %s), so parallel behaviour cannot be judged." % (
-                                    base_metrics["benchmark_status"] if base_metrics else "missing"))
+        decision.evaluation_status = INCONCLUSIVE
+        categories = sorted({e.category for e in baseline.errors if e.source == "process"}) if baseline else []
+        decision.reasons.append(
+            "The sequential (1-worker) baseline did not extract any stream successfully (status %s%s), so parallel "
+            "behaviour cannot be judged. This is not evidence against parallel extraction: fix the cause and re-run." % (
+                base_metrics["benchmark_status"] if base_metrics else "missing",
+                ", errors: " + "/".join(categories) if categories else ""))
         return decision
+    decision.max_workers_successfully_tested = 1
+    base_rate_limited = base_metrics.get("rate_limit_encountered") == "YES"
+    decision.max_workers_without_rate_limit = 0 if base_rate_limited else 1
+    if base_rate_limited:
+        decision.warnings.append("the sequential baseline itself encountered rate limiting: even 1 worker is not rate-limit free")
+
     parallel = sorted(w for w in runs if w > 1)
     if not parallel:
         decision.basis = BASIS_NO_PARALLEL_RUN
+        decision.evaluation_status = INCONCLUSIVE
         decision.reasons.append("Only the sequential baseline was run; add a worker count > 1 to evaluate parallel extraction.")
         return decision
 
@@ -175,35 +247,67 @@ def evaluate_tap(tap_name: str, runs: Dict[int, RunResult], metrics: Dict[int, D
     safe = {w: v for w, v in decision.verdicts.items() if v.safe}
     for workers, verdict in sorted(decision.verdicts.items()):
         if verdict.safe:
-            decision.reasons.append("%d workers PASSED all safety checks: %s" % (
-                workers, "; ".join("%s - %s" % (c.name, c.detail) for c in verdict.checks[:4])))
+            decision.reasons.append("%d workers PASSED all safety checks%s: %s" % (
+                workers, " (rate limiting encountered but recovered)" if verdict.rate_limited else "",
+                "; ".join("%s - %s" % (c.name, c.detail) for c in verdict.checks[:4])))
             decision.warnings.extend("%d workers: %s" % (workers, w) for w in verdict.warnings)
         else:
             decision.reasons.append("%d workers FAILED: %s" % (workers, "; ".join(
                 "%s - %s" % (c.name, c.detail) for c in verdict.failed_checks)))
+            decision.warnings.extend("%d workers: %s" % (workers, w) for w in verdict.warnings)
+
+    # Highest worker count whose run passed every check.
+    if safe:
+        decision.max_workers_successfully_tested = max(safe)
+
+    # Highest worker count that, together with every lower tested count, had no rate-limit signal.
+    if not base_rate_limited:
+        for workers in parallel:
+            verdict = decision.verdicts[workers]
+            if verdict.safe and not verdict.rate_limited and metrics[workers].get("rate_limit_encountered") == "NO":
+                decision.max_workers_without_rate_limit = workers
+            else:
+                break
 
     if not safe:
-        decision.reasons.append("No tested parallel configuration satisfied all safety checks, so parallel extraction "
-                                "is not considered safe for this tap on the tested data.")
+        only_transient = all(v.non_concurrency_failures_only for v in decision.verdicts.values())
+        if only_transient:
+            decision.evaluation_status = INCONCLUSIVE
+            decision.basis = BASIS_TRANSIENT
+            decision.reasons.append(
+                "No parallel configuration passed, but every failure was a network/auth/environment error unrelated to "
+                "concurrency. This is INCONCLUSIVE rather than evidence that the tap cannot run in parallel: re-run.")
+        else:
+            decision.reasons.append("No tested parallel configuration satisfied all safety checks, so parallel extraction "
+                                    "is not considered safe for this tap on the tested data.")
         return decision
 
     decision.can_parallel = "YES"
-    scored = {w: (v.speedup or 0.0) for w, v in safe.items()}
-    best = max(scored.values())
-    chosen = min(w for w, s in scored.items() if s >= 0.95 * best)
-    decision.best_speedup = scored[chosen]
-    if scored[chosen] <= 1.05:
+    speed = {w: (v.speedup or 0.0) for w, v in safe.items()}
+    # Prefer worker counts that never touched a rate limit; fall back to safe counts that recovered from it.
+    clean = {w: s for w, s in speed.items() if not decision.verdicts[w].rate_limited
+             and w <= max(decision.max_workers_without_rate_limit, 1)}
+    pool = clean or speed
+    best = max(pool.values())
+    chosen = min(w for w, s in pool.items() if s >= 0.95 * best)
+    decision.best_speedup = pool[chosen]
+    if not clean:
+        decision.warnings.append("every safe parallel worker count met rate limiting (recovered by the tap's retries); "
+                                 "the recommendation is the best of those")
+    if pool[chosen] <= 1.05:
         decision.recommended_workers = 1
         decision.reasons.append("Parallel extraction is technically viable but gave no measurable speedup "
-                                "(best safe %.2fx), so sequential execution (1) is recommended." % scored[chosen])
+                                "(best safe %.2fx), so sequential execution (1) is recommended." % pool[chosen])
     else:
         decision.recommended_workers = chosen
         decision.reasons.append(
-            "Recommended: %d workers (%.2fx). It is the smallest safe worker count reaching >= 95%% of the best safe "
-            "speedup (%.2fx); more workers add risk without meaningful gain." % (chosen, scored[chosen], best)
-            if chosen != max(safe) or len(safe) > 1 else
-            "Recommended: %d workers (%.2fx), the only safe tested parallel configuration." % (chosen, scored[chosen]))
-        if scored[chosen] < config.recommendation_min_speedup:
+            "Recommended: %d workers (%.2fx). It is the smallest %sworker count reaching >= 95%% of the best speedup "
+            "(%.2fx) in its pool; more workers add risk without meaningful gain." % (
+                chosen, pool[chosen], "rate-limit-free safe " if clean else "safe ", best)
+            if len(pool) > 1 else
+            "Recommended: %d workers (%.2fx), the only %sparallel configuration." % (
+                chosen, pool[chosen], "rate-limit-free safe " if clean else "safe "))
+        if pool[chosen] < config.recommendation_min_speedup:
             decision.warnings.append("Speedup %.2fx is below the %.2fx threshold for a worthwhile gain." % (
-                scored[chosen], config.recommendation_min_speedup))
+                pool[chosen], config.recommendation_min_speedup))
     return decision

@@ -5,7 +5,8 @@
     "tap-jira",
     "tap-oracle-fusion",
     "tap-sap-success-factor",
-    "tap-activecampaign"
+    "tap-activecampaign",
+    "tap-chargify"
   ],
   "timeout_seconds": 1800,
   "stream_timeout_seconds": 1800,
@@ -15,10 +16,14 @@
   "keep_unit_outputs": false,
   "native_baseline": false,
   "log_level": "INFO",
+  "check_environment": true,
+  "baseline_fail_fast": 3,
+  "schedule_order": "longest_first",
   "default_record_limit": null,
   "tap_record_limits": {
-    "tap-oracle-fusion": 500,
-    "tap-activecampaign": 500
+    "tap-oracle-fusion": 200,
+    "tap-activecampaign": 500,
+    "tap-chargify": 300
   },
   "stream_record_limits": {
     "tap-jira": {
@@ -28,8 +33,11 @@
       "contacts": 500
     }
   },
+  "max_streams": null,
+  "tap_max_streams": {
+    "tap-oracle-fusion": 8
+  },
   "max_429_ratio": 0.10,
   "record_tolerance_pct": 2.0,
-  "recommendation_min_speedup": 1.2,
-  "schedule_order": "catalog"
+  "recommendation_min_speedup": 1.2
 }

@@ -1,7 +1,9 @@
 """Catalog loading, stream selection and work-unit planning (tap-agnostic)."""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -195,7 +197,9 @@ def select_all_streams(catalog_path: str, script_path: Optional[str]) -> None:
         module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
         spec.loader.exec_module(module)  # type: ignore[union-attr]
         if hasattr(module, "add_selected_to_catalog"):
-            module.add_selected_to_catalog(pathlib.Path(catalog_path))
+            # The tap's helper prints progress (with emoji); capture it so a non-UTF-8 console cannot break the run.
+            with contextlib.redirect_stdout(io.StringIO()):
+                module.add_selected_to_catalog(pathlib.Path(catalog_path))
             return
     catalog = load_json_file(catalog_path)
     for stream in catalog.get("streams", []):

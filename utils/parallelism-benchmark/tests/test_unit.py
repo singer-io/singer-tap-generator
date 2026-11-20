@@ -12,9 +12,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import error_analyzer as ea  # noqa: E402
 from catalog_utils import plan_units  # noqa: E402
-from config import (BenchmarkConfig, ConfigError, RecordLimitPolicy, build_arg_parser, load_config,  # noqa: E402
-                    new_run_id)
+from config import (BenchmarkConfig, ConfigError, RecordLimitPolicy, StreamSamplePolicy, build_arg_parser,  # noqa: E402
+                    load_config, new_run_id)
 from decision import BASIS_NO_PARALLEL_RUN, evaluate_tap  # noqa: E402
+from error_analyzer import ErrorRecord  # noqa: E402
 from metrics import (COMPLETED, COMPLETED_WITH_LIMIT, FAILED, PARTIAL, RunResult, StreamTally,  # noqa: E402
                      UnitResult, build_stream_results, compare_to_baseline, concurrency_stats, run_metrics,
                      summarize_events)
@@ -293,6 +294,157 @@ def test_decision_no_gain_recommends_one_worker():
 def test_decision_requires_a_parallel_run():
     decision = _evaluate(par_workers=1)
     assert decision.can_parallel == "NO" and decision.basis == BASIS_NO_PARALLEL_RUN
+    assert decision.evaluation_status == "INCONCLUSIVE"
+
+
+def _error(category):
+    return ErrorRecord(tap_name="t", stream_name="b", worker_id=2, worker_count=2, timestamp="x", category=category,
+                       http_status=None, message="m", retry_count=0, stream_eventually_succeeded=False, source="process")
+
+
+def _multi(spec, base_failed=False, base_rate=False):
+    """Evaluate a tap from a {workers: dict(end, failed, rate, category)} description (baseline = 1 worker, 10 s)."""
+    def rate_http():
+        return summarize_events([{"ev": "process_start", "ts": 0}, {"ev": "http", "ts": 1.0, "dur": 0.1, "status": 429}]
+                                + [{"ev": "http", "ts": 2.0, "dur": 0.1, "status": 200}] * 30)
+
+    def build(workers, end, failed=False, rate=False, category="SERVER_ERROR"):
+        if workers == 1:
+            units = [_unit("a", 0, 5, FAILED if failed else COMPLETED, workers=1),
+                     _unit("b", 5, 10, FAILED if failed else COMPLETED, workers=1)]
+            wall = 10.0
+        else:
+            units = [_unit("a", 0, end, workers=workers), _unit("b", 0, end, FAILED if failed else COMPLETED,
+                                                               workers=workers, worker=2)]
+            wall = end
+        run = RunResult(tap_name="t", worker_count=workers, started_ts=0, ended_ts=wall, selected_streams=["a", "b"],
+                        units=units)
+        run.merge_consistent = True
+        if failed:
+            units[1].errors = [_error(category)]
+        if rate:
+            units[0].http = rate_http()
+        run.errors = [e for u in units for e in u.errors]
+        return run
+
+    runs = {1: build(1, 10, failed=base_failed, rate=base_rate)}
+    for workers, options in spec.items():
+        runs[workers] = build(workers, **options)
+    metrics = {w: run_metrics(r) for w, r in runs.items()}
+    speed = {w: (10.0 / (m["execution_duration_seconds"] or 1)) for w, m in metrics.items()}
+    return evaluate_tap("t", runs, metrics, speed, BenchmarkConfig(), []), metrics
+
+
+def test_decision_separates_success_from_rate_limit_free_workers():
+    decision, metrics = _multi({2: dict(end=5.0), 3: dict(end=3.4), 4: dict(end=2.6, rate=True)})
+    assert decision.can_parallel == "YES" and decision.evaluation_status == "CONCLUSIVE"
+    assert decision.max_workers_successfully_tested == 4          # 4 workers ran fine (rate limiting was recovered)
+    assert decision.max_workers_without_rate_limit == 3           # but 4 workers did hit the rate limit
+    assert decision.recommended_workers == 3                      # best of the rate-limit-free counts
+    assert metrics[4]["rate_limit_encountered"] == "YES" and metrics[3]["rate_limit_encountered"] == "NO"
+    assert metrics[3]["extraction_status"] == "SUCCESS"
+
+
+def test_decision_rate_limit_free_count_is_conservative():
+    decision, _ = _multi({2: dict(end=5.0), 3: dict(end=3.4, rate=True), 4: dict(end=2.6)})
+    assert decision.max_workers_successfully_tested == 4
+    assert decision.max_workers_without_rate_limit == 2           # 4 was clean but 3 was not: stop at the first limit
+
+
+def test_decision_when_every_parallel_count_met_rate_limiting():
+    decision, _ = _multi({2: dict(end=5.0, rate=True), 3: dict(end=3.4, rate=True)})
+    assert decision.can_parallel == "YES" and decision.max_workers_without_rate_limit == 1
+    assert decision.recommended_workers == 3 and any("recovered" in w for w in decision.warnings)
+
+
+def test_decision_baseline_that_is_rate_limited_has_no_rate_limit_free_workers():
+    decision, _ = _multi({2: dict(end=5.0)}, base_rate=True)
+    assert decision.max_workers_without_rate_limit == 0 and decision.can_parallel == "YES"
+
+
+def test_decision_baseline_failure_is_inconclusive_not_a_verdict():
+    decision, metrics = _multi({2: dict(end=5.0), 3: dict(end=3.4)}, base_failed=True)
+    assert metrics[1]["extraction_status"] == "FAILURE"
+    assert decision.can_parallel == "NO" and decision.evaluation_status == "INCONCLUSIVE"
+    assert decision.basis == "NOT_EVALUATED_BASELINE_FAILED" and "not evidence against" in decision.reasons[0]
+
+
+def test_decision_network_only_failures_are_inconclusive_but_real_failures_are_conclusive():
+    decision, _ = _multi({2: dict(end=5.0, failed=True, category="NETWORK")})
+    assert decision.can_parallel == "NO" and decision.evaluation_status == "INCONCLUSIVE"
+    assert decision.basis == "EVALUATED_TRANSIENT_FAILURES_ONLY"
+    assert decision.verdicts[2].non_concurrency_failures_only and not decision.verdicts[2].safe
+    decision, _ = _multi({2: dict(end=5.0, failed=True, category="SERVER_ERROR")})
+    assert decision.can_parallel == "NO" and decision.evaluation_status == "CONCLUSIVE"
+    assert not decision.verdicts[2].non_concurrency_failures_only
+    assert decision.max_workers_successfully_tested == 1 and decision.max_workers_without_rate_limit == 1
+
+
+def test_a_transient_failure_at_one_count_does_not_hide_a_working_higher_count():
+    decision, _ = _multi({2: dict(end=5.0), 3: dict(end=3.4, failed=True, category="NETWORK"), 4: dict(end=2.6)})
+    assert decision.can_parallel == "YES" and decision.evaluation_status == "CONCLUSIVE"
+    assert decision.verdicts[3].non_concurrency_failures_only and decision.max_workers_successfully_tested == 4
+    assert decision.max_workers_without_rate_limit == 2           # conservative: stops at the count we could not confirm
+
+
+def test_environment_errors_are_classified_and_never_counted_as_extraction_errors():
+    for text in ("ModuleNotFoundError: No module named 'requests'",
+                 "worker_runner: console script 'tap-jira' not found in this environment",
+                 "FileNotFoundError: [Errno 2] No such file or directory: 'catalog.json'"):
+        assert ea.classify_text(text) == ea.ENVIRONMENT
+    scanner = ea.StderrScanner()
+    scanner.feed("worker_runner: console script 'tap-x' not found in this environment")
+    assert ea.classify_text(scanner.final_error_text) == ea.ENVIRONMENT
+
+
+def test_rate_limit_encountered_and_extraction_status_per_run():
+    clean = RunResult(tap_name="t", worker_count=1, started_ts=0, ended_ts=2, selected_streams=["a"],
+                      units=[_unit("a", 0, 2, workers=1)])
+    assert run_metrics(clean)["rate_limit_encountered"] == "NO" and run_metrics(clean)["extraction_status"] == "SUCCESS"
+    unit = _unit("a", 0, 2, workers=1)
+    unit.http = summarize_events([{"ev": "process_start", "ts": 0}, {"ev": "http_unavailable", "ts": 0}])
+    unknown = run_metrics(RunResult(tap_name="t", worker_count=1, started_ts=0, ended_ts=2, selected_streams=["a"], units=[unit]))
+    assert unknown["rate_limit_encountered"] == "UNKNOWN" and unknown["http_429_count"] is None
+    unit = _unit("a", 0, 2, workers=1)
+    unit.throttle_log_mentions = 1                                  # the tap logged "rate limit"
+    assert run_metrics(RunResult(tap_name="t", worker_count=1, started_ts=0, ended_ts=2, selected_streams=["a"],
+                                 units=[unit]))["rate_limit_encountered"] == "YES"
+    failed = run_metrics(RunResult(tap_name="t", worker_count=1, started_ts=0, ended_ts=2, selected_streams=["a"],
+                                   units=[_unit("a", 0, 2, FAILED, workers=1)]))
+    assert failed["extraction_status"] == "FAILURE"
+
+
+def test_http_instrumentation_never_breaks_a_tap_without_requests(monkeypatch):
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "worker_support", "worker_runner.py")
+    spec = importlib.util.spec_from_file_location("worker_runner_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setitem(sys.modules, "requests", None)              # makes "import requests" raise ImportError
+    assert module._install_http_hook() is False                     # pylint: disable=protected-access
+
+
+def test_stream_sample_policy_precedence(tmp_path):
+    path = _write_config(tmp_path, {"max_streams": 10, "tap_max_streams": {"tap-a": 3}})
+    policy = StreamSamplePolicy(load_config(_args([], path)))
+    assert policy.resolve("tap-a") == (3, "config-tap") and policy.resolve("tap-b") == (10, "config-global")
+    policy = StreamSamplePolicy(load_config(_args(["--max-streams", "5"], path)))
+    assert policy.resolve("tap-a") == (5, "cli-global") and policy.resolve("tap-b") == (5, "cli-global")
+    policy = StreamSamplePolicy(load_config(_args(["--max-streams", "5", "--tap-max-streams", "tap-a=2"], path)))
+    assert policy.resolve("tap-a") == (2, "cli-tap") and policy.resolve("tap-b") == (5, "cli-global")
+    policy = StreamSamplePolicy(load_config(_args(["--all-streams"], path)))
+    assert policy.resolve("tap-a") == (None, "cli-all-streams")
+    assert StreamSamplePolicy(BenchmarkConfig()).resolve("tap-a") == (None, "all-streams")
+    with pytest.raises(ConfigError, match=">= 1"):
+        load_config(_args([], _write_config(tmp_path, {"tap_max_streams": {"tap-a": 0}})))
+
+
+def test_csv_puts_the_answer_columns_first():
+    assert CSV_COLUMNS[:9] == [
+        "tap_name", "can_parallel_extraction_be_done", "max_workers_successfully_tested",
+        "max_recommended_workers_without_rate_limit", "worker_count", "rate_limit_encountered", "extraction_status",
+        "total_records", "execution_duration_seconds"]
+    assert len(CSV_COLUMNS) == len(set(CSV_COLUMNS))
 
 
 # ----------------------------------------------------------------------------- output / pump / reports

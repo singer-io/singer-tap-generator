@@ -74,7 +74,12 @@ def _redact_url(url):
 
 
 def _install_http_hook():
-    import requests  # pylint: disable=import-outside-toplevel
+    """Wrap ``requests.Session.send``. Returns False (never raises) if ``requests`` is not importable, so the
+    instrumentation can never be the reason an extraction fails."""
+    try:
+        import requests  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        return False
 
     original_send = requests.Session.send
     guard = threading.local()
@@ -123,6 +128,7 @@ def _install_http_hook():
             guard.active = False
 
     requests.Session.send = instrumented_send
+    return True
 
 
 class _BackoffHandler(logging.Handler):
@@ -202,21 +208,46 @@ def _load_entry_point(script_name, entry_spec=None):
     raise SystemExit("worker_runner: console script %r not found in this environment" % script_name)
 
 
+def check_environment(script_name, entry_spec=None):
+    """Readiness probe: can this interpreter load the tap's entry point? Makes no network calls."""
+    report = {"python": sys.version.split()[0], "executable": sys.executable, "requests": None, "ok": False}
+    try:
+        import requests  # pylint: disable=import-outside-toplevel
+        report["requests"] = getattr(requests, "__version__", "unknown")
+    except ImportError:
+        pass
+    try:
+        entry = _load_entry_point(script_name, entry_spec)
+        report["ok"] = callable(entry)
+        report["entry"] = getattr(entry, "__module__", "")
+        if not report["ok"]:
+            report["error"] = "entry point is not callable"
+    except BaseException as exc:  # pylint: disable=broad-except
+        report["error"] = "%s: %s" % (type(exc).__name__, exc)
+    print(json.dumps(report))
+    return 0 if report["ok"] else 3
+
+
 def main():
     global _events_fh  # pylint: disable=global-statement
     parser = argparse.ArgumentParser()
     parser.add_argument("--script", required=True)
     parser.add_argument("--entry", default=None, help="optional module:function overriding console-script lookup")
+    parser.add_argument("--check", action="store_true", help="only verify that the tap's entry point can be loaded")
     parser.add_argument("tap_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.check:
+        return check_environment(args.script, args.entry)
     tap_args = args.tap_args[1:] if args.tap_args[:1] == ["--"] else args.tap_args
 
     events_path = os.environ.get("BENCH_EVENTS_FILE")
     if events_path:
         _events_fh = open(events_path, "a", encoding="utf-8")  # pylint: disable=consider-using-with
-        _install_http_hook()
+        hooked = _install_http_hook()
         logging.getLogger("backoff").addHandler(_BackoffHandler())
         _emit({"ev": "process_start", "ts": time.time()})
+        if not hooked:
+            _emit({"ev": "http_unavailable", "ts": time.time(), "msg": "requests not importable: HTTP not measured"})
 
     entry = _load_entry_point(args.script, args.entry)
     rule_text = os.environ.get("BENCH_LIMIT_RULE")

@@ -108,7 +108,7 @@ def _hash_tree(path):
 class Env:
     """A throwaway workspace: fake tap repo + registry + benchmark config + results/logs folders."""
 
-    def __init__(self, tmp_path, api_url, catalog_streams, bench_config=None):
+    def __init__(self, tmp_path, api_url, catalog_streams, bench_config=None, entry_point="fake_tap:main"):
         self.root = tmp_path
         self.repo = tmp_path / "ws" / "fake-tap"
         for sub in ("tmp/configs", "tmp/commands", "tmp/catalogs", "tmp/outputs"):
@@ -125,7 +125,7 @@ class Env:
             "fake-tap": {
                 "repo_path": str(self.repo), "enabled": True, "config_path": "tmp/configs/config.json",
                 "sync_command_path": "tmp/commands/sync_run_command.txt", "catalog_path": "tmp/catalogs/catalog.json",
-                "python_path": sys.executable, "entry_point": "fake_tap:main",
+                "python_path": sys.executable, "entry_point": entry_point,
                 "extra_env": {"PYTHONPATH": os.path.join(HERE, "fake_tap_support")},
                 "required_config_keys": ["base_url"], "aliases": ["fake"],
                 "isolation_findings": ["fake tap: stateless streams"]},
@@ -165,8 +165,10 @@ class Env:
 def api():
     server = FakeApi({
         "a": {"pages": 3}, "b": {"pages": 2}, "c": {"pages": 5}, "d": {"pages": 1}, "leaky": {"pages": 1},
-        "bad": {"pages": 1, "mode": "fail500"}, "throttled": {"pages": 2, "mode": "429_first"},
-        "fragile": {"pages": 4, "mode": "reject_concurrent"}, "slow1": {"pages": 4}, "slow2": {"pages": 4}})
+        "bad": {"pages": 1, "mode": "fail500"}, "bad2": {"pages": 1, "mode": "fail500"},
+        "bad3": {"pages": 1, "mode": "fail500"}, "bad4": {"pages": 1, "mode": "fail500"},
+        "throttled": {"pages": 2, "mode": "429_first"},
+        "fragile": {"pages": 12, "mode": "reject_concurrent"}, "slow1": {"pages": 12}, "slow2": {"pages": 4}})
     server.start()
     yield server
     server.stop()
@@ -186,11 +188,19 @@ def test_full_workflow_yes_artifacts_and_no_tap_changes(tmp_path, api):
                  "execution_summary.json", "config_used.json"):
         assert (run_dir / name).is_file(), name
     rows = env.rows(run_dir / "parallelism_report.csv")
+    with open(run_dir / "parallelism_report.csv", encoding="utf-8") as handle:
+        header = handle.readline().strip().split(",")
+    assert header[:9] == ["tap_name", "can_parallel_extraction_be_done", "max_workers_successfully_tested",
+                          "max_recommended_workers_without_rate_limit", "worker_count", "rate_limit_encountered",
+                          "extraction_status", "total_records", "execution_duration_seconds"]
     tap_rows = {int(r["worker_count"]): r for r in rows if r["tap_name"] == "fake-tap"}
     assert set(tap_rows) == {1, 2}
     assert all(r["can_parallel_extraction_be_done"] in ("YES", "NO") for r in rows)
     assert tap_rows[2]["can_parallel_extraction_be_done"] == "YES" and tap_rows[2]["worker_count_safe"] == "YES"
     assert int(tap_rows[2]["recommended_worker_count"]) == 2 and tap_rows[1]["worker_count_safe"] == "BASELINE"
+    assert tap_rows[2]["max_workers_successfully_tested"] == "2" and tap_rows[2]["evaluation_status"] == "CONCLUSIVE"
+    assert tap_rows[2]["max_recommended_workers_without_rate_limit"] == "2"
+    assert tap_rows[1]["rate_limit_encountered"] == "NO" and tap_rows[1]["extraction_status"] == "SUCCESS"
     assert int(tap_rows[2]["max_observed_concurrency"]) == 2 and int(tap_rows[1]["max_observed_concurrency"]) == 1
     assert tap_rows[1]["total_records"] == tap_rows[2]["total_records"] and tap_rows[1]["records_match_baseline"] == "BASELINE"
     assert tap_rows[2]["records_match_baseline"] == "MATCH" and float(tap_rows[2]["speedup"]) > 1.0
@@ -213,7 +223,8 @@ def test_full_workflow_yes_artifacts_and_no_tap_changes(tmp_path, api):
     log = (env.logs / "fake-tap" / "2026-01-01_00-00-00" / "workers_2.log").read_text()
     assert "[TIMELINE]" in log and "[WORKER-2] START" in log and "max_observed=2" in log
     txt = (run_dir / "parallelism_report.txt").read_text()
-    assert "Can Parallel Extraction Be Done? YES" in txt and "Recommended Worker Count: 2" in txt
+    assert "Can Parallel Extraction Be Done? YES" in txt and "Recommended worker count                 : 2" in txt
+    assert "Max workers successfully tested          : 2" in txt
     assert "SKIPPED_INVALID_CONFIG" in txt and "D. REASONS FOR NO DECISIONS" in txt
 
     # credentials the (fake) tap leaked to stderr must never reach logs or reports
@@ -272,13 +283,17 @@ def test_failed_stream_is_reported_and_is_not_blamed_on_parallelism(tmp_path, ap
 
 
 def test_stream_that_only_fails_under_concurrency_gives_NO(tmp_path, api):
-    env = Env(tmp_path, api.url, [_selected("fragile"), _selected("slow1"), _selected("slow2")])
+    env = Env(tmp_path, api.url, [_selected("fragile"), _selected("slow1")])
     assert env.run(run_id="2026-01-04_00-00-00") == 0
     run_dir = env.results / "2026-01-04_00-00-00"
     rows = env.by_workers(run_dir / "parallelism_report.csv")
     assert rows[1]["benchmark_status"] == "COMPLETED"
     assert rows[2]["failed_stream_names"] == "fragile" and rows[2]["worker_count_safe"] == "NO"
     assert rows[2]["can_parallel_extraction_be_done"] == "NO" and rows[2]["recommended_worker_count"] == "0"
+    # the 2-worker run is faster only because it failed a stream: no speedup may be reported for it
+    assert rows[2]["speedup"] == "" and rows[2]["improvement_percentage"] == ""
+    assert "not like-for-like" in rows[2]["notes"] and rows[1]["extraction_status"] == "SUCCESS"
+    assert rows[2]["extraction_status"] == "PARTIAL"
     txt = (run_dir / "parallelism_report.txt").read_text()
     assert "streams_complete" in txt and "PARALLEL-ONLY" in txt and "Can Parallel Extraction Be Done? NO" in txt
 
@@ -288,6 +303,11 @@ def test_recovered_429_is_tracked_but_does_not_force_NO(tmp_path, api):
     assert env.run(run_id="2026-01-05_00-00-00") == 0
     rows = env.by_workers(env.results / "2026-01-05_00-00-00" / "parallelism_report.csv")
     assert int(rows[1]["http_429_count"]) >= 1 and rows[1]["benchmark_status"] == "COMPLETED"
+    assert rows[1]["rate_limit_encountered"] == "YES" and rows[2]["rate_limit_encountered"] == "NO"
+    assert rows[1]["extraction_status"] == "SUCCESS"
+    # the baseline itself met the rate limit, so no worker count can be called rate-limit free
+    assert rows[2]["max_recommended_workers_without_rate_limit"] == "0"
+    assert rows[2]["max_workers_successfully_tested"] == "2"
     assert int(rows[1]["retry_count"]) >= 1
     assert rows[2]["can_parallel_extraction_be_done"] == "YES" and rows[2]["worker_count_safe"] == "YES"
 
@@ -317,6 +337,80 @@ def test_longest_first_schedule_keeps_results_in_catalog_order(tmp_path, api):
     assert queued[0] == "c"                                   # c has the most pages, so it is handed out first
     summary = json.loads((env.results / "2026-01-07_00-00-00" / "execution_summary.json").read_text())
     assert summary["configuration"]["schedule_order"] == "longest_first"
+
+
+def test_broken_environment_is_reported_as_environment_not_as_a_parallelism_verdict(tmp_path, api):
+    """The real-world failure: a tap whose virtualenv cannot start it must be SKIPPED_ENVIRONMENT, never NO."""
+    env = Env(tmp_path, api.url, BASIC, entry_point="module_that_is_not_installed:main")
+    assert env.run("--workers", "1", "2", run_id="2026-01-08_00-00-00") == 0
+    run_dir = env.results / "2026-01-08_00-00-00"
+    rows = env.rows(run_dir / "parallelism_report.csv")
+    row = [r for r in rows if r["tap_name"] == "fake-tap"][0]
+    assert row["benchmark_status"] == "SKIPPED_ENVIRONMENT" and row["extraction_status"] == "SKIPPED"
+    assert row["evaluation_status"] == "NOT_EVALUATED" and row["decision_basis"] == "NOT_EVALUATED_ENVIRONMENT"
+    assert "pip install -e" in row["error_summary"] and "module_that_is_not_installed" in row["error_summary"]
+    assert not (env.logs / "fake-tap").exists()                 # nothing was executed
+    assert api.requests == {}                                   # and no API call was made
+    assert "NOT_EVALUATED" in (run_dir / "parallelism_report.txt").read_text()
+
+
+def test_environment_failure_during_the_run_discards_the_tap_results(tmp_path, api):
+    env = Env(tmp_path, api.url, [_selected("envbreak"), _selected("d"), _selected("b")])
+    assert env.run("--workers", "1", "2", run_id="2026-01-08_00-00-01") == 0
+    run_dir = env.results / "2026-01-08_00-00-01"
+    row = [r for r in env.rows(run_dir / "parallelism_report.csv") if r["tap_name"] == "fake-tap"]
+    assert len(row) == 1 and row[0]["benchmark_status"] == "SKIPPED_ENVIRONMENT"
+    assert "stopped being runnable" in row[0]["error_summary"] and "missing_dependency" in row[0]["error_summary"]
+    assert (env.logs / "fake-tap" / "2026-01-08_00-00-01" / "workers_1.log").is_file()
+    assert not (env.logs / "fake-tap" / "2026-01-08_00-00-01" / "workers_2.log").exists()   # stopped immediately
+    assert env.rows(run_dir / "stream_level_results.csv") == []
+
+
+def test_failed_baseline_is_inconclusive_and_parallel_runs_are_not_attempted(tmp_path, api):
+    env = Env(tmp_path, api.url, [_selected("bad"), _selected("bad2"), _selected("bad3"), _selected("bad4")])
+    assert env.run("--workers", "1", "2", "3", run_id="2026-01-08_00-00-02") == 0
+    run_dir = env.results / "2026-01-08_00-00-02"
+    rows = env.by_workers(run_dir / "parallelism_report.csv")
+    assert set(rows) == {1}                                     # no pointless higher-worker runs
+    assert rows[1]["extraction_status"] == "FAILURE" and rows[1]["can_parallel_extraction_be_done"] == "NO"
+    assert rows[1]["evaluation_status"] == "INCONCLUSIVE" and rows[1]["decision_basis"] == "NOT_EVALUATED_BASELINE_FAILED"
+    assert "were NOT run" in (run_dir / "parallelism_report.txt").read_text()
+    assert "stopped after the first 3 work units" in rows[1]["notes"]
+    assert "continue_on_stream_failure" not in rows[1]["notes"]     # the real reason is reported, not a wrong one
+    assert sorted(p.name for p in (env.logs / "fake-tap" / "2026-01-08_00-00-02").iterdir()) == ["workers_1.log"]
+    assert "INCONCLUSIVE" in (run_dir / "parallelism_report.txt").read_text()
+    assert api.requests.get("bad4") is None                     # fail-fast: the 4th stream was never requested
+
+
+def test_stream_sampling_is_identical_for_every_worker_count_and_flagged(tmp_path, api, capsys):
+    env = Env(tmp_path, api.url, [_selected("a"), _selected("b"), _selected("c"), _selected("d")],
+              {"tap_max_streams": {"fake": 3}})
+    assert env.run("--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "benchmarked=3" in out and "SAMPLED (config-tap)" in out and "planned runs: 2 worker count(s)" in out
+    assert env.run("--workers", "1", "2", "--max-streams", "2", run_id="2026-01-08_00-00-03") == 0   # CLI beats the file
+    run_dir = env.results / "2026-01-08_00-00-03"
+    rows = env.by_workers(run_dir / "parallelism_report.csv")
+    assert rows[1]["total_streams"] == rows[2]["total_streams"] == "2"
+    assert {r["stream_name"] for r in env.rows(run_dir / "stream_level_results.csv")} == {"a", "b"}
+    assert "SAMPLED" in (run_dir / "parallelism_report.txt").read_text()
+    assert env.run("--workers", "1", "--all-streams", run_id="2026-01-08_00-00-04") == 0
+    assert env.by_workers(env.results / "2026-01-08_00-00-04" / "parallelism_report.csv")[1]["total_streams"] == "4"
+
+
+def test_same_tap_gives_the_same_conclusion_in_a_different_folder(tmp_path, api):
+    """Reproducibility: the verdict depends on the tap's behaviour, not on where the framework/tap live."""
+    outcomes = []
+    for name in ("workspace_one", "deeply/nested/workspace_two"):
+        folder = tmp_path / name
+        folder.mkdir(parents=True)
+        env = Env(folder, api.url, [_selected("a"), _selected("b"), _selected("c"), _selected("d")])
+        assert env.run("--workers", "1", "2", run_id="2026-01-09_00-00-00") == 0
+        rows = env.by_workers(env.results / "2026-01-09_00-00-00" / "parallelism_report.csv")
+        outcomes.append([(w, r["can_parallel_extraction_be_done"], r["max_workers_successfully_tested"],
+                          r["extraction_status"], r["total_records"], r["successful_streams"], r["evaluation_status"])
+                         for w, r in sorted(rows.items())])
+    assert outcomes[0] == outcomes[1] and outcomes[0][1][1] == "YES"
 
 
 def test_invalid_configuration_is_rejected_with_exit_code_2(tmp_path, api, capsys):

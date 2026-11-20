@@ -10,20 +10,34 @@ from config import utc_iso
 from decision import Decision
 
 CSV_COLUMNS = [
-    "tap_name", "benchmark_status", "can_parallel_extraction_be_done", "recommended_worker_count",
-    "worker_count", "worker_count_safe", "total_streams", "successful_streams", "failed_streams", "limited_streams",
-    "total_records", "record_limit", "sequential_duration_seconds", "execution_duration_seconds",
-    "improvement_percentage", "speedup", "throughput_records_per_second", "max_observed_concurrency",
-    "http_429_count", "throttling_count", "retry_count", "http_4xx_count", "http_5xx_count", "timeout_count",
-    "extraction_error_count", "failed_stream_names", "error_summary", "start_time", "end_time",
-    # additional columns
+    # --- primary columns (the answer, at a glance)
+    "tap_name",
+    "can_parallel_extraction_be_done",             # YES/NO: parallel extraction technically worked (tap level)
+    "max_workers_successfully_tested",             # highest worker count whose run passed every check (tap level)
+    "max_recommended_workers_without_rate_limit",  # highest worker count with no rate-limit signal up to it (tap level)
+    "worker_count",                                # workers used in THIS run (row level)
+    "rate_limit_encountered",                      # YES/NO/UNKNOWN in THIS run
+    "extraction_status",                           # SUCCESS / PARTIAL / FAILURE / SKIPPED in THIS run
+    "total_records",
+    "execution_duration_seconds",                  # execution time of THIS run
+    # --- decision detail
+    "recommended_worker_count", "evaluation_status", "benchmark_status", "worker_count_safe",
+    "speedup", "improvement_percentage", "sequential_duration_seconds", "throughput_records_per_second",
+    # --- volume and concurrency
+    "total_streams", "successful_streams", "failed_streams", "limited_streams", "record_limit",
+    "max_observed_concurrency",
+    # --- rate limits and errors
+    "http_429_count", "throttling_count", "rate_limit_signals", "retry_count", "http_4xx_count", "http_5xx_count",
+    "timeout_count", "extraction_error_count", "failed_stream_names", "error_summary", "start_time", "end_time",
+    # --- additional columns
     "decision_scope", "decision_basis", "decision_summary", "worker_safety_notes", "execution_mode", "run_id",
     "rate_limit_info", "skipped_streams", "attempted_streams", "not_attempted_streams", "success_rate_percentage",
     "limited_stream_names", "scheduling_units", "avg_observed_concurrency", "concurrency_verdict",
     "total_stream_execution_seconds", "parallel_efficiency_percentage", "api_request_count",
     "api_requests_after_limit", "network_error_count", "throttle_log_mentions", "http_status_counts",
-    "detected_rate_limit_headers", "rate_limit_near_count", "rate_limit_min_remaining", "records_match_baseline", "longest_unit_seconds",
-    "longest_unit_name", "avg_process_startup_seconds", "skipped_stream_names", "notes", "log_file", "output_file",
+    "detected_rate_limit_headers", "rate_limit_near_count", "rate_limit_min_remaining", "records_match_baseline",
+    "longest_unit_seconds", "longest_unit_name", "avg_process_startup_seconds", "skipped_stream_names", "notes",
+    "log_file", "output_file",
 ]
 
 STREAM_COLUMNS = ["tap_name", "stream_name", "worker_count", "worker_id", "start_time", "end_time",
@@ -34,8 +48,9 @@ STREAM_COLUMNS = ["tap_name", "stream_name", "worker_count", "worker_id", "start
 ERROR_COLUMNS = ["tap_name", "stream_name", "worker_id", "worker_count", "timestamp", "category", "http_status",
                  "message", "retry_count", "stream_eventually_succeeded", "source", "url"]
 
-DECISION_SCOPE = "TAP_LEVEL: same value on every row of this tap (derived from all worker counts); " \
-                 "worker_count_safe is per row"
+DECISION_SCOPE = "TAP_LEVEL (can_parallel, max_workers_*, recommended, evaluation_status): same value on every row of " \
+                 "this tap, derived from all worker counts; worker_count, rate_limit_encountered, extraction_status and " \
+                 "worker_count_safe are per row"
 
 
 @dataclass
@@ -63,7 +78,9 @@ class TapSection:
 def skipped_row(tap_name: str, status: str, reasons: Sequence[str], run_id: str, rate_limit: str = "UNKNOWN") -> Dict[str, Any]:
     now = utc_iso()
     return {"tap_name": tap_name, "benchmark_status": status, "can_parallel_extraction_be_done": "NO",
-            "recommended_worker_count": 0, "decision_scope": DECISION_SCOPE, "decision_basis": "NOT_EVALUATED_SKIPPED",
+            "max_workers_successfully_tested": 0, "max_recommended_workers_without_rate_limit": 0,
+            "recommended_worker_count": 0, "evaluation_status": "NOT_EVALUATED", "rate_limit_encountered": "N/A",
+            "extraction_status": "SKIPPED", "decision_scope": DECISION_SCOPE, "decision_basis": "NOT_EVALUATED_SKIPPED",
             "decision_summary": "not benchmarked: " + "; ".join(reasons), "rate_limit_info": rate_limit,
             "error_summary": "; ".join(reasons), "start_time": now, "end_time": now, "execution_mode": "none",
             "run_id": run_id, "notes": "not executed"}
@@ -133,7 +150,10 @@ def write_summary_json(path: str, meta: Dict[str, Any], sections: Sequence[TapSe
     summary["totals"] = {
         "taps_total": len(sections), "taps_tested": len(tested),
         "taps_parallel_yes": sum(1 for s in tested if s.decision and s.decision.can_parallel == "YES"),
-        "taps_parallel_no": sum(1 for s in tested if s.decision and s.decision.can_parallel == "NO"),
+        "taps_parallel_no": sum(1 for s in tested if s.decision and s.decision.can_parallel == "NO"
+                               and s.decision.evaluation_status == "CONCLUSIVE"),
+        "taps_inconclusive": sum(1 for s in tested if s.decision and s.decision.can_parallel == "NO"
+                                 and s.decision.evaluation_status != "CONCLUSIVE"),
         "taps_skipped": len(sections) - len(tested)}
     summary["taps"] = taps
     with open(path, "w", encoding="utf-8", newline="\n") as handle:
@@ -252,7 +272,9 @@ def write_txt(path: str, sections: Sequence[TapSection], meta: Dict[str, Any]) -
     width = 110
     tested = [s for s in sections if not s.skipped]
     yes = [s for s in tested if s.decision and s.decision.can_parallel == "YES"]
-    no = [s for s in tested if s.decision and s.decision.can_parallel == "NO"]
+    inconclusive = [s for s in tested if s.decision and s.decision.can_parallel == "NO"
+                    and s.decision.evaluation_status != "CONCLUSIVE"]
+    no = [s for s in tested if s.decision and s.decision.can_parallel == "NO" and s not in inconclusive]
     skipped = [s for s in sections if s.skipped]
     lines: List[str] = ["=" * width, "PARALLELISM BENCHMARK SUMMARY".center(width), "=" * width, "",
                         "Run ID         : %s" % meta.get("run_id"),
@@ -262,8 +284,8 @@ def write_txt(path: str, sections: Sequence[TapSection], meta: Dict[str, Any]) -
                         "Timeouts       : run=%ss, per-stream=%ss" % (meta.get("timeout_seconds"), meta.get("stream_timeout_seconds")),
                         "Model          : each selected stream (plus its child streams) is a work unit executed by the unmodified",
                         "                 tap in its own process; N workers pull units from one queue. Durations are extraction",
-                        "                 wall-clock only (merge/report excluded). Record limits are applied identically to every",
-                        "                 worker count.", ""]
+                        "                 wall-clock only (merge/report excluded). Record limits and stream samples are applied",
+                        "                 identically to every worker count.", ""]
 
     # ---- A. overall summary
     lines += ["-" * width, "A. OVERALL SUMMARY", "-" * width, "",
@@ -271,25 +293,34 @@ def write_txt(path: str, sections: Sequence[TapSection], meta: Dict[str, Any]) -
               "Taps tested                  : %d" % len(tested),
               "Taps supporting parallelism  : %d  (%s)" % (len(yes), ", ".join(s.tap_name for s in yes) or "-"),
               "Taps NOT supporting          : %d  (%s)" % (len(no), ", ".join(s.tap_name for s in no) or "-"),
+              "Taps INCONCLUSIVE (re-run)   : %d  (%s)" % (len(inconclusive), ", ".join(s.tap_name for s in inconclusive) or "-"),
               "Taps skipped                 : %d  (%s)" % (len(skipped), ", ".join(
                   "%s: %s" % (s.tap_name, s.status) for s in skipped) or "-"), ""]
     summary_rows = []
     improvements = []
     for s in sections:
         if s.skipped:
-            summary_rows.append([s.tap_name, s.status, "NO", "0", "-", "-", "-"])
+            summary_rows.append([s.tap_name, s.status, "NO", "NOT_EVALUATED", "0", "0", "0", "-", "-", "-"])
             continue
         base = next((r for r in s.rows if _is_pool(r) and r.get("worker_count") == 1), {})
-        rec = s.decision.recommended_workers if s.decision else 0
+        decision = s.decision
+        rec = decision.recommended_workers if decision else 0
         best = next((r for r in s.rows if _is_pool(r) and r.get("worker_count") == rec and rec > 1), None)
         if best and best.get("improvement_percentage") is not None:
             improvements.append(best["improvement_percentage"])
         summary_rows.append([
-            s.tap_name, base.get("benchmark_status", "n/a"), s.decision.can_parallel if s.decision else "NO", str(rec),
+            s.tap_name, base.get("benchmark_status", "n/a"), decision.can_parallel if decision else "NO",
+            decision.evaluation_status if decision else "n/a",
+            str(decision.max_workers_successfully_tested if decision else 0),
+            str(decision.max_workers_without_rate_limit if decision else 0), str(rec),
             _fmt(best.get("speedup"), "x") if best else "-", _fmt(best.get("improvement_percentage"), "%") if best else "-",
             s.record_limit_text])
-    lines += render_table(["Tap", "Baseline status", "Parallel OK?", "Recommended workers", "Speedup", "Improvement",
-                           "Record limit"], summary_rows)
+    lines += render_table(["Tap", "Baseline status", "Parallel OK?", "Evaluation", "Max workers OK",
+                           "Max workers w/o rate limit", "Recommended", "Speedup", "Improvement", "Record limit"], summary_rows)
+    lines += ["", "Parallel OK? = parallel extraction technically worked (YES/NO). Max workers OK = highest worker count whose run "
+              "passed every check. Max workers w/o rate limit = highest count with no rate-limit signal at it or below.",
+              "Recommended = best safe count (0 = none, 1 = no gain). Evaluation INCONCLUSIVE/NOT_EVALUATED = the NO is not "
+              "evidence against parallelism (baseline failed, transient errors, tap not runnable)."]
     if improvements:
         lines += ["", "Average execution-time improvement at the recommended worker counts: %.2f%% (over %d tap(s))." % (
             sum(improvements) / len(improvements), len(improvements))]
@@ -301,7 +332,8 @@ def write_txt(path: str, sections: Sequence[TapSection], meta: Dict[str, Any]) -
         if section.skipped:
             lines.append("Status: %s" % section.status)
             lines += ["  - %s" % r for r in section.skip_reasons]
-            lines += ["", "Can Parallel Extraction Be Done? NO (not evaluated - tap skipped)", ""]
+            lines += ["", "Can Parallel Extraction Be Done? NO  (evaluation: NOT_EVALUATED - the tap was not benchmarked, "
+                          "so this is not a verdict on parallelism)", ""]
             continue
         decision = section.decision
         base = next((r for r in section.rows if _is_pool(r) and r.get("worker_count") == 1), {})
@@ -310,7 +342,8 @@ def write_txt(path: str, sections: Sequence[TapSection], meta: Dict[str, Any]) -
                   "Rate limit            : %s" % section.rate_limit_info,
                   "Sequential baseline   : %s s" % _fmt(base.get("execution_duration_seconds"), "", 1), ""]
         headers = ["Workers", "Mode", "Status", "Duration", "Speedup", "Improvement", "Success", "Failed", "Limited",
-                   "Records", "Rec/s", "429", "Throttle", "Retries", "4xx", "5xx", "Timeouts", "MaxConc", "Safe"]
+                   "Records", "Rec/s", "429", "Throttle", "Retries", "4xx", "5xx", "Timeouts", "MaxConc", "RateLimit",
+                   "Safe"]
         table_rows = []
         for row in section.rows:
             table_rows.append([
@@ -323,7 +356,7 @@ def write_txt(path: str, sections: Sequence[TapSection], meta: Dict[str, Any]) -
                 _fmt(row.get("throughput_records_per_second"), "", 1), _fmt(row.get("http_429_count")),
                 _fmt(row.get("throttling_count")), _fmt(row.get("retry_count")), _fmt(row.get("http_4xx_count")),
                 _fmt(row.get("http_5xx_count")), _fmt(row.get("timeout_count")), _fmt(row.get("max_observed_concurrency")),
-                row.get("worker_count_safe") or "-"])
+                row.get("rate_limit_encountered") or "-", row.get("worker_count_safe") or "-"])
         lines += render_table(headers, table_rows) + [""]
 
         lines.append("Concurrency validation (from stream start/end timestamps):")
@@ -334,12 +367,15 @@ def write_txt(path: str, sections: Sequence[TapSection], meta: Dict[str, Any]) -
         lines += render_table(["Workers", "MaxConc", "AvgConc", "Sum stream time", "Wall clock", "Efficiency",
                                "Verdict", "Records vs baseline"], conc_rows, "  ") + [""]
 
-        lines += ["Can Parallel Extraction Be Done? %s" % (decision.can_parallel if decision else "NO"),
-                  "Recommended Worker Count: %s%s" % (
+        lines += ["Can Parallel Extraction Be Done? %s   (evaluation: %s)" % (
+                      decision.can_parallel if decision else "NO", decision.evaluation_status if decision else "n/a"),
+                  "  Max workers successfully tested          : %s" % (decision.max_workers_successfully_tested if decision else 0),
+                  "  Max workers without rate limiting        : %s" % (decision.max_workers_without_rate_limit if decision else 0),
+                  "  Recommended worker count                 : %s%s" % (
                       decision.recommended_workers if decision else 0,
                       {0: "  (0 = no safe parallel configuration)", 1: "  (1 = parallel viable but no measurable gain)"}.get(
                           decision.recommended_workers if decision else 0, "")),
-                  "Decision basis: %s" % (decision.basis if decision else "n/a"), ""]
+                  "  Decision basis                           : %s" % (decision.basis if decision else "n/a"), ""]
 
         lines.append("Observations:")
         lines += ["- " + o for o in observations(section)]
@@ -372,14 +408,19 @@ def write_txt(path: str, sections: Sequence[TapSection], meta: Dict[str, Any]) -
 
     # ---- D. NO decisions
     lines += ["-" * width, "D. REASONS FOR NO DECISIONS", "-" * width, ""]
-    if not no and not skipped:
+    if not no and not skipped and not inconclusive:
         lines += ["No tap was classified NO.", ""]
     for section in no:
-        lines.append("%s - NO" % section.tap_name)
+        lines.append("%s - NO (conclusive)" % section.tap_name)
+        lines += ["  * " + r for r in (section.decision.reasons if section.decision else [])]
+        lines.append("")
+    for section in inconclusive:
+        lines.append("%s - NO but INCONCLUSIVE (not evidence against parallel extraction - fix the cause and re-run)" %
+                     section.tap_name)
         lines += ["  * " + r for r in (section.decision.reasons if section.decision else [])]
         lines.append("")
     for section in skipped:
-        lines.append("%s - NO (skipped, not evaluated)" % section.tap_name)
+        lines.append("%s - NO (%s: not evaluated)" % (section.tap_name, section.status))
         lines += ["  * " + r for r in section.skip_reasons]
         lines.append("")
     lines += ["Notes:", "- One run per configuration: timings are subject to API/network variance.",

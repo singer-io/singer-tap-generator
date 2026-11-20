@@ -60,6 +60,8 @@ def main():
         meta = _root_meta(stream)
         if name not in selected or meta.get("parent-tap-stream-id"):
             continue
+        if name == "envbreak":   # simulates a tap whose dependency disappeared (e.g. a venv being re-installed mid-run)
+            raise ModuleNotFoundError("No module named 'missing_dependency'")
         children = [s["tap_stream_id"] for s in streams
                     if _root_meta(s).get("parent-tap-stream-id") == name and s["tap_stream_id"] in selected]
         for emitted in [name] + children:
