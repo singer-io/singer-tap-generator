@@ -5,7 +5,7 @@ and how many workers you can use before rate limits or errors appear.
 
 It only **measures**. It never changes a tap (no tap code, config, catalog, command or output file is written).
 
-**Contents:** [Quick start](#quick-start) · [How it works](#how-it-works) · [Setup](#setup) · [Configure](#configure) ·
+**Contents:** [Quick start](#quick-start) · [Set the number of workers](#how-to-set-the-number-of-workers) · [How it works](#how-it-works) · [Setup](#setup) · [Configure](#configure) ·
 [Run](#run) · [Read the results](#read-the-results) · [Troubleshooting](#troubleshooting) · [Add a tap](#add-a-new-tap) · [Limitations](#limitations)
 
 ---
@@ -16,12 +16,73 @@ It only **measures**. It never changes a tap (no tap code, config, catalog, comm
 cd parallelism-benchmark
 
 python benchmark.py --dry-run                              # 1. check everything, run nothing
-python benchmark.py --taps tap-jira --workers 1 2 3 4      # 2. benchmark one tap
+python benchmark.py --taps tap-jira --workers 1 2 3 4      # 2. benchmark one tap with 1, 2, 3 and 4 workers
 python benchmark.py                                        # 3. benchmark every enabled tap (see configs/benchmark_config.json)
 ```
 
 Then open `results/latest.json` → it points to the newest run folder. Inside, read **`parallelism_report.txt`** (for people)
 or **`parallelism_report.csv`** (for spreadsheets).
+
+---
+
+## How to set the number of workers
+
+**Example: test `tap-chargify` with 1, 2, 4, 8 and 12 workers.**
+
+### Way 1 – on the command line (simplest, nothing to edit)
+
+```bash
+python benchmark.py --taps tap-chargify --workers 1 2 4 8 12
+```
+
+That is all. The framework runs the tap once per worker count and compares every run with the 1-worker run.
+
+### Way 2 – in the configuration file
+
+Open `configs/benchmark_config.json` and change `workers` (and, if you want only Chargify, `enabled_taps`):
+
+```json
+{
+  "workers": [1, 2, 4, 8, 12],
+  "enabled_taps": ["tap-chargify"]
+}
+```
+
+Then run it with no options: `python benchmark.py`
+
+> To keep the shipped file unchanged, copy it to `configs/my_test.json`, edit the copy and run
+> `python benchmark.py --config configs/my_test.json`.
+
+### Rules to remember
+
+| Rule | Detail |
+|---|---|
+| **1 is always included** | It is the baseline everything is compared with. `--workers 8` runs `1` and `8`. |
+| **Order and duplicates do not matter** | `--workers 12 4 1 2 8 4` is the same as `--workers 1 2 4 8 12`. |
+| **Command line beats the file** | The file says `[1, 2]` and you type `--workers 1 3 4` → `1 3 4` is used. |
+| **Any whole number ≥ 1** | `0` or text is rejected with a clear message before anything runs. |
+| **You cannot use more workers than the tap has streams** | Chargify has **11** streams, so `12` workers can only run 11 at once. The report says so (`effective_workers = 11`) and treats 12 as the same test as 11. |
+| **Each worker is a separate Python process** | 12 workers = 12 processes at the same time. Make sure your machine and the API can take it. |
+
+### What you get for Chargify (real run, 300 records per stream)
+
+| Workers asked | Workers that really ran at once | Time | Speedup |
+|---|---|---|---|
+| 1 | 1 | 143 s | – |
+| 2 | 2 | 69 s | 2.06× |
+| **4** | **4** | **39 s** | **3.68×** ← recommended |
+| 8 | 8 | 43 s | 3.33× |
+| 12 | 11 (only 11 streams) | 43 s | 3.33× |
+
+**How to read it:** going from 4 to 8 or 12 workers did **not** help. One stream, `transactions`, takes about 41 s on its own (the next ones, `statements` and `invoices`, take about 21 s), and the sequential total is about 143 s,
+so the best possible speedup is roughly 143 ÷ 41 ≈ 3.5×. With 4 workers you are already there; extra workers just wait. No rate limit (HTTP 429) appeared at any count, so the report says
+`max workers successfully tested = 11`, `max workers without rate limit = 11`, and **recommended = 4** (the smallest count that reaches the best speed).
+
+### Good habits
+- **Start small** (`--workers 1 2 4`), then add bigger counts only if the speedup is still growing.
+- **Check the cost first:** `python benchmark.py --taps tap-chargify --workers 1 2 4 8 12 --dry-run` prints the plan (and warns when you ask for more workers than there are streams).
+- **Keep it quick:** add `--record-limit 300` (stops each stream after 300 records) – Chargify with 1, 2, 4, 8, 12 workers takes about 6 minutes this way.
+- If rate limits appear at a high count, the report shows the highest count **without** rate limits in `max_recommended_workers_without_rate_limit`.
 
 ---
 
@@ -107,7 +168,7 @@ Settings come from **`configs/benchmark_config.json`**; **command-line options o
 
 | Setting | What it does |
 |---|---|
-| `workers` | worker counts to test (`1` is always added) |
+| `workers` | worker counts to test, e.g. `[1, 2, 4, 8, 12]` (`1` is always added; see [Set the number of workers](#how-to-set-the-number-of-workers)) |
 | `enabled_taps` | taps to run (aliases such as `tap-sap-success-factor` work) |
 | `default_record_limit`, `tap_record_limits`, `stream_record_limits` | stop each stream after N records (see below) |
 | `max_streams`, `tap_max_streams` | benchmark only the first N work units of a tap (see below) |
@@ -143,7 +204,8 @@ Sampled runs are labelled **SAMPLED** in the report. Use at least as many work u
 
 ```bash
 python benchmark.py                                          # everything enabled in the config file
-python benchmark.py --workers 1 2 3 4                        # choose worker counts
+python benchmark.py --workers 1 2 3 4                        # choose worker counts (all enabled taps)
+python benchmark.py --taps tap-chargify --workers 1 2 4 8 12 # any list of counts, for one tap
 python benchmark.py --taps tap-activecampaign --workers 1 2 3
 python benchmark.py --taps tap-chargify --record-limit 300
 python benchmark.py --taps tap-oracle-fusion --workers 1 2 --record-limit 100 --max-streams 4
@@ -183,9 +245,9 @@ logs/<tap>/<run>/workers_<N>.log     scheduling, start/end times, errors, retrie
 | Column | Answers | Level |
 |---|---|---|
 | `can_parallel_extraction_be_done` | **Does it work in parallel?** `YES` = at least one parallel run passed every check | tap |
-| `max_workers_successfully_tested` | **How many workers worked?** highest worker count whose run passed every check | tap |
+| `max_workers_successfully_tested` | **How many workers worked?** most workers that really ran at once in a run that passed every check (never more than the tap has streams) | tap |
 | `max_recommended_workers_without_rate_limit` | **How many workers without rate limits?** highest count with no rate-limit signal at it or below | tap |
-| `worker_count` | workers used in this run | row |
+| `worker_count` | workers you asked for in this run (`effective_workers` = how many could really run at once: never more than the tap's number of streams) | row |
 | `rate_limit_encountered` | `YES` / `NO` / `UNKNOWN` (HTTP not measurable) / `N/A` | row |
 | `extraction_status` | `SUCCESS` / `PARTIAL` / `FAILURE` / `SKIPPED` | row |
 | `total_records`, `execution_duration_seconds` | records and wall-clock time of this run | row |

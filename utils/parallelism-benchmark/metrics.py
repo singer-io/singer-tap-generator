@@ -449,6 +449,7 @@ def run_metrics(run: RunResult) -> Dict[str, Any]:
         "concurrency_verdict": concurrency_verdict,
         "concurrency_histogram": conc["histogram"],
         "scheduling_units": len(units),
+        "effective_workers": min(run.worker_count, len(units)) if (units and run.mode == "stream_pool") else None,
         "longest_unit_seconds": round(longest[0], 3) if longest[0] is not None else None,
         "longest_unit_name": longest[1],
         "avg_process_startup_seconds": round(statistics.mean(startups), 3) if startups else None,

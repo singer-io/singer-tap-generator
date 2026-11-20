@@ -113,6 +113,9 @@ def build_row(spec: TapSpec, run: RunResult, baseline_metrics: Optional[Dict[str
                              metrics["successful_streams"], baseline_metrics.get("successful_streams")))
     if plan.limited and plan.filtered_streams:
         notes.append("limited run: %d selected stream(s) not scheduled (filters/--max-streams)" % len(plan.filtered_streams))
+    if run.mode == "stream_pool" and metrics.get("scheduling_units") and run.worker_count > metrics["scheduling_units"]:
+        notes.append("%d workers requested but only %d work units: at most %d streams can run at once" % (
+            run.worker_count, metrics["scheduling_units"], metrics["scheduling_units"]))
     if run.run_timed_out:
         notes.append("run timeout budget exhausted")
     if run.stop_reason:
@@ -414,6 +417,8 @@ def print_plan(spec: TapSpec, policy: RecordLimitPolicy, max_units: Optional[int
     if pre.needs_discovery:
         print("    catalog: no usable existing catalog - discovery will run at benchmark time (one API call) and all "
               "streams will be selected; the plan is shown once discovered")
+        print("    note: worker counts above the number of discovered streams add no extra concurrency "
+              "(the benchmark report states this per run)")
         return
     plan = plan_units(load_json_file(spec.abs_catalog), spec, max_units, policy.limit_for(spec.name))
     print("    catalog streams=%d selected=%d excluded=%d benchmarked=%d work_units=%d record_limit=%s" % (
@@ -424,6 +429,10 @@ def print_plan(spec: TapSpec, policy: RecordLimitPolicy, max_units: Optional[int
     print("    python=%s" % spec.python_executable())
     print("    planned runs: %d worker count(s) %s x %d work unit(s) = %d tap process(es)" % (
         len(config.workers), config.workers, len(plan.units), len(config.workers) * len(plan.units)))
+    too_many = [w for w in config.workers if w > len(plan.units)]
+    if too_many:
+        print("    WARNING: worker count(s) %s exceed the %d work units - at most %d streams can run at once, "
+              "so those counts add no extra concurrency" % (too_many, len(plan.units), len(plan.units)))
     for unit in plan.units[:25]:
         limits = {s: policy.resolve(spec.name, s) for s in unit.selected}
         shown = ",".join("%s[%s]" % (s, "unlimited" if lim is None else "%s:%s" % (lim, src))

@@ -413,6 +413,22 @@ def test_same_tap_gives_the_same_conclusion_in_a_different_folder(tmp_path, api)
     assert outcomes[0] == outcomes[1] and outcomes[0][1][1] == "YES"
 
 
+def test_more_workers_than_streams_is_reported_honestly(tmp_path, api, capsys):
+    env = Env(tmp_path, api.url, [_selected("a"), _selected("b"), _selected("d")])
+    assert env.run("--workers", "8", "2", "--dry-run") == 0
+    assert "WARNING: worker count(s) [8] exceed the 3 work units" in capsys.readouterr().out
+    assert env.run("--workers", "8", "2", run_id="2026-01-10_00-00-00") == 0      # unsorted on purpose
+    rows = env.by_workers(env.results / "2026-01-10_00-00-00" / "parallelism_report.csv")
+    assert sorted(rows) == [1, 2, 8]                                              # 1 added, order fixed
+    assert rows[8]["effective_workers"] == "3" and rows[8]["max_observed_concurrency"] == "3"
+    assert rows[8]["max_workers_successfully_tested"] == "3"                      # not 8: only 3 streams exist
+    assert rows[2]["effective_workers"] == "2"
+    assert "only 3 work units" in rows[8]["notes"] and "only" not in rows[2]["notes"]
+    assert rows[8]["can_parallel_extraction_be_done"] == "YES"
+    txt = (env.results / "2026-01-10_00-00-00" / "parallelism_report.txt").read_text()
+    assert "only 3 work units exist" in txt and "extra 5 worker(s)" in txt
+
+
 def test_invalid_configuration_is_rejected_with_exit_code_2(tmp_path, api, capsys):
     env = Env(tmp_path, api.url, [_selected("d")], {"workers": [0]})
     assert env.run() == 2

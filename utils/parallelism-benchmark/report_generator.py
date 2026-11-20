@@ -25,8 +25,7 @@ CSV_COLUMNS = [
     "speedup", "improvement_percentage", "sequential_duration_seconds", "throughput_records_per_second",
     # --- volume and concurrency
     "total_streams", "successful_streams", "failed_streams", "limited_streams", "record_limit",
-    "max_observed_concurrency",
-    # --- rate limits and errors
+    "max_observed_concurrency", "effective_workers",
     "http_429_count", "throttling_count", "rate_limit_signals", "retry_count", "http_4xx_count", "http_5xx_count",
     "timeout_count", "extraction_error_count", "failed_stream_names", "error_summary", "start_time", "end_time",
     # --- additional columns
@@ -210,6 +209,10 @@ def observations(section: TapSection) -> List[str]:
         parts = ["%d workers: %s" % (workers, verb),
                  "max concurrent streams observed %s of %d (%s)" % (row.get("max_observed_concurrency"), workers,
                                                                   row.get("concurrency_verdict"))]
+        effective = row.get("effective_workers")
+        if effective not in (None, "") and int(effective) < workers:
+            parts.append("only %d work units exist, so at most %d streams can run at once - the extra %d worker(s) "
+                         "were idle and add no information" % (int(effective), int(effective), workers - int(effective)))
         if base is not None:
             extra_fail = (row.get("failed_streams") or 0) - (base.get("failed_streams") or 0)
             if extra_fail > 0:

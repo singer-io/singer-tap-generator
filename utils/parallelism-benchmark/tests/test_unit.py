@@ -303,25 +303,37 @@ def _error(category):
 
 
 def _multi(spec, base_failed=False, base_rate=False):
-    """Evaluate a tap from a {workers: dict(end, failed, rate, category)} description (baseline = 1 worker, 10 s)."""
+    """Evaluate a 4-stream tap from a {workers: dict(end, failed, rate, category)} description.
+
+    The baseline is sequential (4 x 2.5 s = 10 s). A parallel run with W workers schedules the 4 units W at a time,
+    so observed concurrency is min(W, 4), exactly as real workers would produce.
+    """
+    names = ["a", "b", "c", "d"]
+
     def rate_http():
         return summarize_events([{"ev": "process_start", "ts": 0}, {"ev": "http", "ts": 1.0, "dur": 0.1, "status": 429}]
                                 + [{"ev": "http", "ts": 2.0, "dur": 0.1, "status": 200}] * 30)
 
     def build(workers, end, failed=False, rate=False, category="SERVER_ERROR"):
+        status = FAILED if (failed and workers == 1) else COMPLETED
         if workers == 1:
-            units = [_unit("a", 0, 5, FAILED if failed else COMPLETED, workers=1),
-                     _unit("b", 5, 10, FAILED if failed else COMPLETED, workers=1)]
+            units = [_unit(n, i * 2.5, (i + 1) * 2.5, status, workers=1) for i, n in enumerate(names)]
             wall = 10.0
         else:
-            units = [_unit("a", 0, end, workers=workers), _unit("b", 0, end, FAILED if failed else COMPLETED,
-                                                               workers=workers, worker=2)]
+            rounds = -(-len(names) // workers)
+            slot = end / rounds
+            units = [_unit(n, (i // workers) * slot, (i // workers + 1) * slot,
+                           FAILED if (failed and n == "d") else COMPLETED, workers=workers, worker=i % workers + 1)
+                     for i, n in enumerate(names)]
             wall = end
-        run = RunResult(tap_name="t", worker_count=workers, started_ts=0, ended_ts=wall, selected_streams=["a", "b"],
+        run = RunResult(tap_name="t", worker_count=workers, started_ts=0, ended_ts=wall, selected_streams=list(names),
                         units=units)
         run.merge_consistent = True
-        if failed:
-            units[1].errors = [_error(category)]
+        if failed and workers > 1:
+            units[-1].errors = [_error(category)]
+        elif failed:
+            for unit in units:
+                unit.errors = [_error(category)]
         if rate:
             units[0].http = rate_http()
         run.errors = [e for u in units for e in u.errors]
@@ -333,6 +345,49 @@ def _multi(spec, base_failed=False, base_rate=False):
     metrics = {w: run_metrics(r) for w, r in runs.items()}
     speed = {w: (10.0 / (m["execution_duration_seconds"] or 1)) for w, m in metrics.items()}
     return evaluate_tap("t", runs, metrics, speed, BenchmarkConfig(), []), metrics
+
+
+def test_workers_option_is_sorted_deduplicated_and_always_includes_one(tmp_path):
+    path = _write_config(tmp_path, {"workers": [4, 2]})
+    assert load_config(_args([], path)).workers == [1, 2, 4]
+    assert load_config(_args(["--workers", "12", "8", "4", "2", "1", "4"], path)).workers == [1, 2, 4, 8, 12]
+    assert load_config(_args(["--workers", "8"], path)).workers == [1, 8]
+    with pytest.raises(ConfigError, match=">= 1"):
+        load_config(_args(["--workers", "0", "2"], path))
+
+
+def test_effective_workers_is_capped_by_the_number_of_work_units():
+    run = RunResult(tap_name="t", worker_count=12, started_ts=0, ended_ts=4, selected_streams=["a", "b", "c"],
+                    units=[_unit("a", 0, 4, workers=12), _unit("b", 0, 4, workers=12, worker=2),
+                           _unit("c", 0, 4, workers=12, worker=3)])
+    metrics = run_metrics(run)
+    assert metrics["effective_workers"] == 3 and metrics["max_observed_concurrency"] == 3
+    assert metrics["concurrency_verdict"] == "FULL"                  # all 3 streams that exist did overlap
+    assert run_metrics(RunResult(tap_name="t", worker_count=2, started_ts=0, ended_ts=4, selected_streams=["a", "b", "c"],
+                                 units=[_unit("a", 0, 2, workers=2), _unit("b", 0, 2, workers=2, worker=2),
+                                        _unit("c", 2, 4, workers=2)]))["effective_workers"] == 2
+
+
+def test_decision_warns_when_workers_exceed_work_units():
+    decision, metrics = _multi({2: dict(end=5.0), 8: dict(end=2.6)})  # the helper tap has 4 work units
+    assert any("8 workers requested but this tap has only 4 work units" in w for w in decision.warnings)
+    assert not any("2 workers requested" in w for w in decision.warnings)
+    assert metrics[8]["effective_workers"] == 4
+
+
+def test_max_workers_reported_are_the_workers_that_actually_ran():
+    """Asking for 8 workers on a 4-stream tap proves 4 concurrent workers, not 8."""
+    decision, _ = _multi({2: dict(end=5.0), 4: dict(end=2.6), 8: dict(end=2.6), 12: dict(end=2.6)})
+    assert decision.can_parallel == "YES"
+    assert decision.max_workers_successfully_tested == 4
+    assert decision.max_workers_without_rate_limit == 4
+    assert decision.recommended_workers == 4                      # smallest count reaching the best speedup
+
+
+def test_rate_limit_at_a_high_count_is_not_hidden_by_the_cap():
+    decision, _ = _multi({2: dict(end=5.0), 4: dict(end=2.6), 8: dict(end=2.6, rate=True)})
+    assert decision.max_workers_successfully_tested == 4 and decision.max_workers_without_rate_limit == 4
+    assert decision.verdicts[8].rate_limited
 
 
 def test_decision_separates_success_from_rate_limit_free_workers():

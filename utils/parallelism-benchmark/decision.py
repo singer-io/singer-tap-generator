@@ -3,8 +3,9 @@
 Three separate questions are answered from the *measured* runs (nothing is assumed from configuration):
 
 1. ``can_parallel`` (YES/NO)            - did at least one parallel worker count technically work and pass every check?
-2. ``max_workers_successfully_tested``  - the highest worker count whose run passed every check.
-3. ``max_workers_without_rate_limit``   - the highest worker count such that it, and every lower tested count, ran
+2. ``max_workers_successfully_tested``  - the highest number of workers that actually ran at once in a run that passed
+                                          every check (capped by the number of streams the tap has).
+3. ``max_workers_without_rate_limit``   - the highest such number where it, and every lower tested count, ran
                                           without any rate-limit signal.
 
 ``evaluation_status`` says how much to trust the answer: CONCLUSIVE, INCONCLUSIVE (e.g. the sequential baseline failed,
@@ -244,6 +245,13 @@ def evaluate_tap(tap_name: str, runs: Dict[int, RunResult], metrics: Dict[int, D
             and metrics[workers]["successful_streams"] > 0)
         decision.verdicts[workers] = _verdict(workers, runs[workers], metrics[workers], baseline, base_metrics,
                                               speedups.get(workers), config)
+    for workers, verdict in sorted(decision.verdicts.items()):
+        units = metrics[workers].get("scheduling_units") or 0
+        if units and workers > units:
+            decision.warnings.append(
+                "%d workers requested but this tap has only %d work units, so at most %d streams ran at once (%d worker(s) "
+                "idle). Counts above %d cannot show more concurrency; treat them as the same test as %d." % (
+                    workers, units, units, workers - units, units, units))
     safe = {w: v for w, v in decision.verdicts.items() if v.safe}
     for workers, verdict in sorted(decision.verdicts.items()):
         if verdict.safe:
@@ -256,16 +264,23 @@ def evaluate_tap(tap_name: str, runs: Dict[int, RunResult], metrics: Dict[int, D
                 "%s - %s" % (c.name, c.detail) for c in verdict.failed_checks)))
             decision.warnings.extend("%d workers: %s" % (workers, w) for w in verdict.warnings)
 
-    # Highest worker count whose run passed every check.
-    if safe:
-        decision.max_workers_successfully_tested = max(safe)
+    def effective(workers: int) -> int:
+        """Workers that could actually run at once: a tap with 11 streams cannot use 12 workers."""
+        units = metrics[workers].get("scheduling_units") or workers
+        return min(workers, units)
 
-    # Highest worker count that, together with every lower tested count, had no rate-limit signal.
+    # Highest number of workers that actually ran concurrently in a run that passed every check.
+    if safe:
+        decision.max_workers_successfully_tested = max(effective(w) for w in safe)
+
+    # Highest number of workers that, together with every lower tested count, had no rate-limit signal.
+    clean_counts: Set[int] = set()
     if not base_rate_limited:
         for workers in parallel:
             verdict = decision.verdicts[workers]
             if verdict.safe and not verdict.rate_limited and metrics[workers].get("rate_limit_encountered") == "NO":
-                decision.max_workers_without_rate_limit = workers
+                decision.max_workers_without_rate_limit = effective(workers)
+                clean_counts.add(workers)
             else:
                 break
 
@@ -285,8 +300,7 @@ def evaluate_tap(tap_name: str, runs: Dict[int, RunResult], metrics: Dict[int, D
     decision.can_parallel = "YES"
     speed = {w: (v.speedup or 0.0) for w, v in safe.items()}
     # Prefer worker counts that never touched a rate limit; fall back to safe counts that recovered from it.
-    clean = {w: s for w, s in speed.items() if not decision.verdicts[w].rate_limited
-             and w <= max(decision.max_workers_without_rate_limit, 1)}
+    clean = {w: s for w, s in speed.items() if w in clean_counts}
     pool = clean or speed
     best = max(pool.values())
     chosen = min(w for w, s in pool.items() if s >= 0.95 * best)
